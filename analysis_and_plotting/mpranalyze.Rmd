@@ -1,0 +1,819 @@
+---
+title: "Untitled"
+output: html_document
+date: "2022-08-24"
+---
+
+```{r message=F}
+library(ggpubr)
+library(ggstatsplot)
+library(gginnards)
+library(ggpointdensity)
+library(stringr)
+library(ggrastr)
+library(ggbreak)
+library(circlize)
+library(ComplexHeatmap)
+library(eulerr)
+library(tidyverse)
+```
+
+```{r}
+insulators = c('A2', 'cHS4', 'ALOXE3')
+
+arrange_ins = function(df){
+    df %>%
+        filter(iBC %in% insulators) %>% 
+        change_iBC_names()
+}
+
+mutants = c('A2_mut', 'cHS4_x3', 'ALOXE3_deltaBbox')
+
+arrange_mut = function(df){
+    df %>% 
+        filter(iBC %in% mutants) %>% 
+        change_iBC_names() 
+}
+```
+
+```{r}
+select_direction = function(df, selected_direction){
+    
+    if (selected_direction == 'upregulated'){
+        df %>% 
+            filter(direction != 'downregulated') 
+    } else if (selected_direction == 'downregulated'){
+        df %>% 
+            filter(direction != 'upregulated') %>% 
+            mutate(direction = factor(direction, levels = c('unchanged', 'downregulated')))
+    }
+}
+```
+
+```{r}
+all_rep_counts = bind_rows(read_rds('../Insulator library v1/nextseq_011322/v1_counts_per_rep_unique_pool_for_mpranalyze.rds'), 
+                           read_rds('../Insulator library v2/nextseq_071122/v2_counts_per_rep_unique_pool_for_mpranalyze.rds')) %>% 
+    mutate(across(contains('count'), function(x){x+1}))
+
+# all_rep_noDNAmin_counts = bind_rows(read_rds('../Insulator library v1/nextseq_011322/v1_counts_per_rep_no_DNA_min_for_mpranalyze.rds'), 
+#                            read_rds('../Insulator library v2/nextseq_071122/v2_counts_per_rep_no_DNA_min_for_mpranalyze.rds')) %>% 
+#     mutate(across(contains('count'), function(x){x+1}))
+```
+
+```{r}
+write_rds(all_rep_counts, 'all_rep_counts_unique_pool_plus1_for_mpranalyse.rds')
+# write_rds(all_rep_noDNAmin_counts, 'all_rep_counts_noDNAmin_plus1_for_mpranalyse.rds')
+```
+
+```{r}
+read_mapping_files = function(filename){
+    read_tsv(filename, 
+             col_names = c('chr', 'start', 'end', 'gBC', 'strand'), 
+             show_col_types = FALSE)
+}
+```
+
+```{r}
+v1_mapping_files = fs::dir_ls(path = '../Insulator library v1/nextseq_011322/', glob = '*unique.bed') %>%
+  as.character() %>%
+  purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_combined_unique.bed') - 1)
+  }) %>% 
+    map(~ read_mapping_files(.x))
+
+v2_mapping_files = fs::dir_ls(path = '../Insulator library v2/nextseq_071122/', glob = '*unique.bed') %>%
+  as.character() %>%
+  purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_combined_unique.bed') - 1)
+  }) %>% 
+    map(~ read_mapping_files(.x))
+```
+
+```{r}
+v1_shared = reduce(v1_mapping_files, inner_join) %>% 
+    mutate(pool = 'Px_v1') %>% 
+    mutate(id  = paste(gBC, pool, sep = '_'))
+v2_shared = reduce(v2_mapping_files, bind_rows) %>% 
+    count(chr, start, end, gBC, strand) %>% 
+    filter(n > 1) %>% 
+    mutate(pool = 'Px_v2') %>% 
+    mutate(id  = paste(gBC, pool, sep = '_')) %>% 
+    select(-n)
+```
+
+```{r}
+v1_mapping_with_pool = names(v1_mapping_files) %>% 
+    map(~ mutate(v1_mapping_files[[.x]], pool = paste0(.x, "_v1"))) %>% 
+    map(~ anti_join(.x, v1_shared, by = 'gBC'))
+
+v2_mapping_with_pool = names(v2_mapping_files) %>% 
+    map(~ mutate(v2_mapping_files[[.x]], pool = paste0(.x, "_v2"))) %>% 
+    map(~ anti_join(.x, v2_shared, by = 'gBC'))
+
+all_mapping_files =
+    c(v1_mapping_with_pool, v2_mapping_with_pool) %>% 
+    reduce(bind_rows) %>% 
+    mutate(id = paste(gBC, pool, sep = '_')) %>% 
+    bind_rows(v1_shared, v2_shared)
+```
+
+```{r}
+select_one_lp = function(df){
+    
+    winning_pool = df %>% 
+        dplyr::count(pool) %>% 
+        arrange(desc(n)) 
+    
+    df %>% 
+        filter(pool == winning_pool$pool[[1]]) %>% 
+        select(-split_name)
+}
+```
+
+```{r}
+# mpranalyse_alphas = read_rds('mpranalyse_output/raw_mpranalyze_alphas.rds')
+full_plus1_alphas = 
+    bind_rows(read_rds('mpranalyse_output/plus1_unique_mpranalyze_alphas.rds'),
+              read_rds('mpranalyse_output/plus1_v1_shared_mpranalyze_alphas.rds'),
+              read_rds('mpranalyse_output/plus1_v2_shared_mpranalyze_alphas.rds')) %>%
+    rownames_to_column('id') %>%
+    pivot_longer(cols = colnames(dplyr::select(., -id)), names_to = 'iBC', values_to = 'alpha') %>%
+    filter(!is.na(alpha)) %>%
+    mutate(alpha = log2(alpha)) %>%
+    inner_join(all_mapping_files) %>%
+    filter(chr != 'chrMT' & chr != 'chrY') 
+
+repeat_lp_locs = full_plus1_alphas %>% 
+    distinct(chr, start, pool) %>% 
+    dplyr::count(chr, start) %>% 
+    filter(n > 1) %>% 
+    select(-n)
+
+selected_repeat_lp_locs = full_plus1_alphas %>% 
+    inner_join(repeat_lp_locs) %>% 
+    mutate(split_name = paste(chr, start)) %>% 
+    split(.$split_name) %>% 
+    map(~ select_one_lp(.x)) %>% 
+    reduce(bind_rows)
+```
+
+```{r}
+mpranalyse_plus1_alphas = full_plus1_alphas %>% 
+    anti_join(repeat_lp_locs) %>% 
+    bind_rows(selected_repeat_lp_locs) 
+```
+
+```{r}
+change_pool_name = function(df){
+    df %>% 
+        separate(id, into = c('gBC', 'pool', 'experiment')) %>%
+        mutate(pool = case_when(
+        experiment == 'v2' & pool == 'P1' ~ 'P3',
+        experiment == 'v2' & pool == 'P2' ~ 'P4',
+        experiment == 'v2' & pool == 'P2' ~ 'P5',
+        experiment == 'v2' & pool == 'P2' ~ 'P6',
+        TRUE ~ pool
+    )) %>% 
+        arrange(pool)
+}
+```
+
+```{r}
+change_iBC_names_table = function(df){
+    df %>%  
+        mutate(iBC = case_when(
+            iBC == 'cHS4_x3' ~ 'cHS4_mut',
+            iBC == 'ALOXE3_deltaBbox' ~ 'ALOXE3_mut',
+            iBC == 'empty' ~ 'no_insulator',
+            iBC == 'A2_mut' ~ 'A2_mut',
+            iBC == 'A2_scrambled' ~ 'A2_scrambled',
+            TRUE ~ iBC
+        )) 
+}
+```
+
+```{r}
+mpranalyse_plus1_alphas %>% 
+    change_pool_name() %>% 
+    select(gBC, iBC, pool, experiment, alpha) %>% 
+    change_iBC_names_table() %>% 
+    mutate_if(is.numeric, round, digits = 4) %>% 
+    write_tsv('supp_table_4-final_alphas.tsv')
+```
+
+```{r}
+mpranalyse_plus1_alphas %>% 
+    inner_join(all_expression) %>%
+    # filter(repressed == 'expressed') %>%
+    ggplot(aes(exp, alpha)) +
+    geom_pointdensity() +
+    pretty_theme_facet() +
+    facet_wrap(~ repressed)
+# 
+ggsave('figures/mpranalyse_plus1_vs_original.png')
+```
+
+```{r}
+iBC_median_alphas = mpranalyse_plus1_alphas %>% 
+    group_by(iBC) %>% 
+    summarise(med_alpha = median(alpha))
+```
+
+```{r}
+mpranalyse_plus1_alphas %>% 
+    change_iBC_names() %>% 
+    filter(iBC %in% c(insulators, 'no insulator')) %>%  
+    ggplot(aes(alpha, iBC)) +
+    geom_violin(fill = 'gray') + 
+    geom_boxplot(width = 0.1, outlier.shape = NA) +
+    pretty_theme() +
+    scale_y_discrete(limits = rev) +
+    ylab('') +
+    xlab('log2(expression)') #+
+    # geom_text(data = iBC_median_alphas, 
+              # aes(x = 5, y = iBC, label = sprintf("%0.2f", med_alpha)))
+
+# ggsave('mpranalyse_figures/ins_expression_violin.png', width = 6, height = 4)
+```
+
+```{r}
+mpranalyse_plus1_alphas %>% 
+    count(id)
+```
+
+```{r}
+empty_exp_split =
+    mpranalyse_plus1_alphas %>%
+    filter(iBC == 'empty') %>%
+    mutate(empty_bins = ntile(alpha, 6)) %>%
+    split(.$empty_bins) %>%
+    map(~ min(.x$alpha))
+
+# mpranalyse_plus1_alphas %>% 
+#     filter(iBC == 'empty') %>% 
+#     arrange(desc(alpha))
+
+ggplot(mpranalyse_plus1_alphas %>% filter(iBC == 'empty'), aes(alpha)) +
+    geom_density() +
+    geom_vline(xintercept = -11.53+3.36) + 
+    geom_vline(xintercept = -11.53+3.36*2) +
+    geom_vline(xintercept = -11.53+3.36*3) +
+    geom_vline(xintercept = -11.53+3.36*4) +
+    geom_vline(xintercept = -11.53+3.36*5)
+```
+
+```{r}
+count_n_per_bin_iBC = function(df){
+    
+    df %>%
+        mutate(bins = case_when(
+            alpha < empty_exp_split$`2` ~ '1',
+            empty_exp_split$`2` <= alpha & alpha < empty_exp_split$`3` ~ '2',
+            empty_exp_split$`3` <= alpha & alpha < empty_exp_split$`4` ~ '3',
+            empty_exp_split$`4` <= alpha & alpha < empty_exp_split$`5` ~ '4',
+            empty_exp_split$`5` <= alpha & alpha < empty_exp_split$`6` ~ '5',
+            # empty_exp_split$`6` <= alpha & alpha < empty_exp_split$`7` ~ '6',
+            # empty_exp_split$`7` <= alpha & alpha < empty_exp_split$`8` ~ '7',
+            TRUE ~ '6'
+        )) #%>%
+        # count(bins)
+
+    # df %>%
+    #     mutate(bins = case_when(
+    #         alpha < -11.53+4.03 ~ '1',
+    #         -11.53+4.03 <= alpha & alpha < -11.53+4.03*2 ~ '2',
+    #         -11.53+4.03*2 <= alpha & alpha < -11.53+4.03*3 ~ '3',
+    #         -11.53+4.03*3 <= alpha & alpha < -11.53+4.03*4 ~ '4',
+    #         -11.53+4.03*4 <= alpha & alpha < -11.53+4.03*5 ~ '5',
+    #         TRUE ~ '5'
+    #     )) %>%
+    #     count(bins)
+    
+    # df %>% 
+    #     mutate(bins = case_when(
+    #         alpha < -7.5 ~ '1',
+    #         -7.5 <= alpha & alpha < -5 ~ '2',
+    #         -5 <= alpha & alpha < -2.5 ~ '3',
+    #         -2.5 <= alpha & alpha < 0 ~ '4',
+    #         0 <= alpha & alpha < 2.5 ~ '5',
+    #         TRUE ~ '6'
+    #     )) %>%
+    #     count(bins)
+}
+```
+
+```{r}
+calculate_n_per_bin_chisq = function(df){
+    
+    chisq =
+        df %>% 
+        inner_join(n_per_bin_per_iBC$empty, by = 'bins') %>% 
+        column_to_rownames('bins') %>%
+        chisq.test()
+
+    chisq$p.value
+    # chisq$residuals
+}
+```
+
+```{r}
+n_per_bin_per_iBC = mpranalyse_plus1_alphas %>% 
+    # change_iBC_names() %>% 
+    split(.$iBC) %>% 
+    map(~ count_n_per_bin_iBC(.x)) 
+
+n_per_bin_per_iBC %>% 
+    purrr::list_modify('empty' = NULL) %>% 
+    map(~ calculate_n_per_bin_chisq(.x)) 
+```
+
+```{r}
+n_per_bin_per_iBC %>% 
+    purrr::list_modify('empty' = NULL) %>% 
+    map(~ bind_rows(.x, n_per_bin_per_iBC$empty)) %>% 
+    map(~ ggbarstats(.x, bins, iBC))
+```
+
+DE
+
+```{r}
+reduce_de_output = function(dfs){
+    names(dfs) %>% 
+    map(~ mutate(dfs[[.x]], iBC = .x)) %>% 
+    map(~ rownames_to_column(.x, 'id')) %>% 
+    reduce(bind_rows) 
+}
+```
+
+```{r}
+unique_mpranalyse_de_output = 
+    fs::dir_ls(path = 'mpranalyse_output/', glob = '*plus1_unique*de.rds') %>%
+    as.character() %>%
+    purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_plus1_unique_mpranalyze_de.rds') - 1)
+    }) %>% 
+    map(~ read_rds(.x))
+
+v1_shared_mpranalyse_de_output = 
+    fs::dir_ls(path = 'mpranalyse_output/', glob = '*plus1_v1*de.rds') %>%
+    as.character() %>%
+    purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_plus1_v1_shared_mpranalyze_de.rds') - 1)
+    }) %>% 
+    map(~ read_rds(.x))
+
+v2_shared_mpranalyse_de_output = 
+    fs::dir_ls(path = 'mpranalyse_output/', glob = '*plus1_v2*de.rds') %>%
+    as.character() %>%
+    purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_plus1_v1_shared_mpranalyze_de.rds') - 1)
+    }) %>% 
+    map(~ read_rds(.x))
+
+all_mpranalyse_de_output = bind_rows(
+    reduce_de_output(unique_mpranalyse_de_output),
+    reduce_de_output(v1_shared_mpranalyse_de_output),
+    reduce_de_output(v2_shared_mpranalyse_de_output)
+)
+```
+
+```{r}
+exp_with_mpranalyse_outliers =
+    inner_join(mpranalyse_plus1_alphas, all_mpranalyse_de_output %>% select(fdr, logFC, id, iBC)) %>% 
+    mutate(outlier = case_when(
+        abs(logFC) > 1 & fdr < 0.05 ~ 'insulated',
+        TRUE ~ 'unchanged'
+    )) %>%
+    mutate(direction = case_when(
+        logFC > 0 & outlier == 'insulated' ~ 'upregulated',
+        logFC < 0 & outlier == 'insulated' ~ 'downregulated',
+        TRUE ~ 'unchanged'
+    ))
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    count(iBC, direction)
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    change_pool_name() %>% 
+    change_iBC_names_table() %>% 
+    select(gBC, iBC, pool, experiment, logFC, fdr, direction) %>%
+    mutate_if(is.numeric, round, digits = 4) %>%
+    write_tsv('supp_table_5-mpranalyse_fold_change.tsv')
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    split(.$iBC) #%>% 
+    # write_rds('mpranalyse_expression_with_outliers.rds')
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    mutate(outlier = case_when(
+        abs(logFC) > 1 & fdr < 0.01 ~ 'insulated',
+        TRUE ~ 'unchanged'
+    )) %>%
+    mutate(direction = case_when(
+        logFC > 0 & outlier == 'insulated' ~ 'upregulated',
+        logFC < 0 & outlier == 'insulated' ~ 'downregulated',
+        TRUE ~ 'unchanged'
+    )) %>% 
+    write_tsv('mpranalyse_expression_with_outliers_low_fdr.tsv')
+```
+
+
+```{r}
+all_mpranalyse_de_output %>% 
+    full_join(reduce(exp_with_deseq_outliers, bind_rows), by = c('id', 'iBC')) %>% 
+    ggplot(aes(fdr, padj)) +
+    geom_point() +
+    pretty_theme() +
+    geom_abline() +
+    xlab('MPRAnalyze') +
+    ylab('DESeq2')
+
+# ggsave('figures/mpranalyse_deseq_pvals.png', width = 7, height = 7)
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>%
+    filter(direction == 'downregulated') %>%
+    split(.$iBC) %>% 
+    map(~ arrange(.x, fdr)) %>% 
+    reduce(bind_rows) %>% 
+    write_tsv('downreg_locs_sorted_by_fdr.tsv')
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    count(iBC, outlier) %>% 
+    pivot_wider(id_cols = iBC, names_from = outlier, values_from = n) %>% 
+    mutate(prop = insulated/(insulated+unchanged)) %>% 
+    change_iBC_names() %>%
+    ggplot(aes(iBC, prop, fill = iBC)) +
+    geom_col(width = 0.8) +
+    pretty_theme() +
+    scale_y_continuous(expand = c(0,0), limits = c(0, .16)) +
+    theme(text = element_text(size = 16)) +
+    xlab('') +
+    ylab('Proportion of insulated locations') +
+    scale_fill_manual(values = c("#a05c7b", "#cfadbd", "#b7990d", "#e2d69e", "#b0b2b8", "#8cada7", "#c5d6d3")) +
+    theme(legend.position = 'none') +
+    scale_x_discrete(labels = function(x) str_wrap(x, width = 5))
+
+ggsave('mpranalyse_figures/proportion outliers per insulator.png', width = 7, height = 5)
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    filter(iBC == 'ALOXE3_deltaBbox') %>% 
+    mutate(downregulated = case_when(
+        direction == 'downregulated' ~ TRUE,
+        TRUE ~ FALSE
+    )) %>% 
+    ggplot(aes(logFC, -log10(fdr), col = outlier)) +
+    rasterise(geom_point(), layer = 'point', dpi = 600) +
+    pretty_theme() +
+    geom_vline(aes(xintercept = 1), linetype = 'dashed') +
+    geom_vline(aes(xintercept = -1), linetype = 'dashed') +
+    geom_hline(aes(yintercept = 1.3), linetype = 'dashed') +
+# ylim(0, 15) + 
+    scale_colour_manual(values = c('#c5d6d3', 'gray')) +
+    # A2
+    # scale_y_break(c(38, 58), ticklabels = c(0, 10, 20, 30, 60, 70)) +
+    # ALOXE3
+    # scale_y_break(c(65, 275), ticklabels = c(280, 300)) +
+    xlab('log2(insulator/no insulator)')
+
+ggsave('mpranalyse_figures/ALOXE3_mut_volcano_plot.pdf', width = 7, height = 7)
+```
+
+```{r}
+p = exp_with_mpranalyse_outliers %>%
+    filter(outlier == 'insulated') %>%
+    change_iBC_names() %>% 
+    filter(iBC %in% insulators) %>%
+    ggbarstats(direction, iBC,
+               results.subtitle = FALSE) +
+    pretty_theme() +
+    theme(text = element_text(size = 18)) +
+    xlab('') +
+    scale_fill_manual(values = c('#214E34', '#87562f')) 
+
+delete_layers(p, "GeomText")
+
+ggsave('mpranalyse_figures/proportion_up_down_regulated_per_ins.png', width = 6.5, height = 6)
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>%
+    filter(outlier == 'insulated') %>%
+    change_iBC_names() %>% 
+    filter(iBC %in% insulators) %>%
+    ggplot(aes(iBC, fill = direction)) +
+    geom_bar(col = 'black') +
+    pretty_theme() +
+    scale_fill_manual(values = c('#87562f', '#214E34')) +
+    scale_y_continuous(expand = c(0,0), limits = c(0, 2200)) +
+    xlab('') +
+    ylab('number of insulated LPs')
+
+ggsave('mpranalyse_figures/number_up_down_regulated_per_ins.pdf', width = 7.5, height = 6)
+```
+
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    ggplot(aes(iBC, alpha, fill = direction)) +
+    geom_boxplot() +
+    pretty_theme()
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    write_tsv('mpranalyse_expression_with_outliers.tsv')
+```
+
+```{r}
+# pdf('figures/A2_outlier_overlap.pdf')
+png('mpranalyse_figures/mpranalyse_deseq_outlier_overlap.png', res = 300, width = 7, height = 7, units = 'in')
+
+current_mpranalyse_list = filter(exp_with_mpranalyse_outliers, 
+                                 outlier == 'insulated') %>% 
+    distinct(id)
+current_deseq_list = reduce(deseq_outliers, bind_rows) %>% 
+    distinct(id)
+
+euler_list = list('MPRAnalyze' = current_mpranalyse_list$id,
+     'DESeq2' = current_deseq_list$id) 
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE, 
+     fill =  c("cornsilk", "cornsilk3"))
+dev.off()
+```
+
+```{r}
+png('figures/A2_mut_mpranalyse_deseq_outlier_overlap.png', res = 300, width = 7, height = 7, units = 'in')
+
+current_mpranalyse_list = filter(exp_with_mpranalyse_outliers, 
+                                 iBC == 'A2_mut' & outlier == 'insulated') 
+
+euler_list = list('MPRAnalyze' = current_mpranalyse_list$id,
+     'DESeq2' = deseq_outliers$A2_mut$id) 
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE, 
+     fill =  c("cornsilk", "cornsilk3"))
+dev.off()
+```
+
+```{r}
+mpranalyse_plus1_alphas %>% 
+    group_by(iBC) %>% 
+    summarise(GWLP = mean(alpha)) %>% 
+    left_join(qpcr_fold_change_mean) %>% 
+    mutate(mean_fc = replace_na(mean_fc, 1)) %>% 
+    ggplot(aes(GWLP, mean_fc, col = iBC)) +
+    geom_point() +
+    pretty_theme() + 
+    ylab('qPCR')
+```
+
+```{r}
+mpranalyse_plus1_alphas %>% 
+    mutate(score = '.') %>%
+    select(chr, start, end, id, score, strand) %>%
+    distinct() #%>%
+    # write_tsv('mpranalyse_combined_LP_locations.bed', col_names = FALSE)
+```
+
+```{r}
+# MPRAnalyse somehow gives more locations than the original version
+mpranalyse_plus1_alphas %>% 
+    distinct(chr, start, id) %>%
+    mutate(name = 'GWLP', type = 'LP') %>%
+    separate(chr, into = c('crap', 'chr'), sep = 'chr') %>%
+    select(chr, start, id, name, type) %>%
+    rename(vpPos = start, vpID = id) %>%
+    write_tsv('GWLP_insulator_mpranalyse_peakHiC_viewpoints.txt')
+```
+
+```{r}
+write_bedfile = function(current_iBC){
+    
+    directions = exp_with_mpranalyse_outliers %>% 
+        anti_join(locs_ins_all_same_dir) %>% 
+        filter(iBC == current_iBC) %>% 
+        select(chr, start, end, id, direction, strand) %>% 
+        split(.$direction)
+    
+    names(directions) %>% 
+        map(~ write_tsv(directions[[.x]], 
+                        paste0('individual_insulator_bedfiles/', current_iBC, '_', .x, '_unshared_locs.bed'), col_names = FALSE))
+}
+```
+
+```{r}
+iBCs %>%  
+    map(~write_bedfile(.x))
+```
+
+```{r}
+plot_empty_alpha = function(df){
+    mpranalyse_plus1_alphas %>% 
+        filter(iBC == 'empty') %>% 
+        dplyr::rename(empty_alpha = alpha) %>% 
+        select(empty_alpha, id) %>% 
+        inner_join(df %>% select(id, direction, iBC, alpha)) 
+}
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>% 
+    map(~ plot_empty_alpha(.x)) %>% 
+    purrr::reduce(bind_rows) %>% 
+    select_direction('upregulated') %>% 
+    mutate(direction = factor(direction, levels = c('unchanged', 'upregulated'))) %>% 
+    arrange_mut() %>% 
+    ggplot(aes(iBC, empty_alpha, group = interaction(iBC, direction))) +
+    geom_violin(aes(fill = direction)) +
+    geom_boxplot(width = 0.1, position = position_dodge(width =0.9), fill = 'white', outlier.shape = NA) +
+    pretty_theme() +
+    scale_fill_manual(values = c('darkgray', '#214E34')) +
+    xlab('') +
+    ylab('uninsulated expression') 
+
+# ggsave('mpranalyse_figures/no insulator upregulated expression per mut.pdf', width = 11, height = 7)
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>% 
+    map(~ plot_empty_alpha(.x)) %>% 
+    reduce(bind_rows) %>% 
+    change_iBC_names() %>%
+    filter(!iBC %in% insulators) %>% 
+    # arrange_mut() %>% 
+    # mutate(iBC = factor(levels = c('cHS4_mut', 'A2_mut', 'ALOXE3_mut', 'A2_scrambled'))) %>%
+    ggplot(aes(alpha, empty_alpha)) +
+    geom_pointdensity() +
+    pretty_theme_facet() + 
+    facet_wrap(~ iBC, nrow = 1) +
+    stat_cor(method = "pearson")
+
+# ggsave('mpranalyse_figures/mut_empty_corr.pdf', width = 12, height = 4)
+```
+
+```{r}
+perform_ks = function(df){
+    
+    ks.test(df$empty_alpha, df$alpha, alternative = 'two.sided')$p.value
+}
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>% 
+    map(~ plot_empty_alpha(.x)) %>% 
+    map(~ sprintf("%.3g", perform_ks(.x)))
+```
+
+```{r}
+corr_mat_alphas = mpranalyse_plus1_alphas %>% 
+    pivot_wider(id_cols = id, names_from = iBC, values_from = alpha) %>% 
+    column_to_rownames('id') %>% 
+    cor()
+```
+
+```{r}
+col_fun = colorRamp2(c(0.6, 1), c("white", "darkblue"))
+
+Heatmap(corr_mat_alphas, 
+        col = col_fun, 
+        name = 'correlations')
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    split(.$iBC) %>% 
+    map(~ bind_rows(.x, mpranalyse_plus1_alphas %>% filter(iBC == 'empty'))) %>% 
+    map(~ mutate(.x, direction = replace_na(direction, 'original'),
+                 iBC = .$iBC[[1]])) %>%
+    reduce(bind_rows) %>% 
+    ggplot(aes(alpha, col = direction)) +
+    geom_density() +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC)
+```
+
+Plot 'repressed' locations
+
+```{r}
+count_repressed = function(df){
+    df %>% 
+    pivot_longer(cols = colnames(select(., contains('.'))), names_to = c('.value', 'rep'),
+                 names_sep = '\\.') %>%
+    filter(DNA_count != 0) %>% 
+    mutate('repressed' = case_when(
+        RNA_count <= 20 ~ 0,
+        TRUE ~ 1
+    )) %>%
+    group_by(gBC, condition) %>%
+    summarise(repressed = sum(repressed)) %>%
+    ungroup()
+}
+```
+
+```{r}
+v1_shared_repressed = read_rds('../Insulator library v1/nextseq_011322/v1_counts_per_rep_shared_pool_for_mpranalyze.rds') %>% 
+    mutate_if(is.numeric, function(x){x-1}) %>% 
+    count_repressed()
+
+v2_shared_repressed = read_rds('../Insulator library v2/nextseq_071122/v2_counts_per_rep_shared_pool_for_mpranalyze.rds') %>% 
+    mutate_if(is.numeric, function(x){x-1}) %>% 
+    count_repressed()
+
+unique_repressed = bind_rows(read_rds('../Insulator library v1/nextseq_011322/v1_counts_per_rep_unique_pool_for_mpranalyze.rds'), 
+                           read_rds('../Insulator library v2/nextseq_071122/v2_counts_per_rep_unique_pool_for_mpranalyze.rds')) %>% 
+    count_repressed()
+```
+
+```{r}
+p = bind_rows(v1_shared_repressed, v2_shared_repressed, unique_repressed) %>% 
+    filter(condition %in% insulators) %>% 
+    mutate(repressed = case_when(
+        repressed == 0 ~ 'repressed',
+        TRUE ~ 'expressed'
+    )) %>% 
+    ggbarstats(repressed, condition,
+               results.subtitle = FALSE,
+               package = "wesanderson",
+               palette = "Moonrise2") +
+    pretty_theme()
+
+delete_layers(p, 'GeomText')
+
+ggsave('mpranalyse_figures/number of repressed locations.pdf', width = 7, height = 6)
+```
+
+```{r}
+read_rds('../Insulator library v2/nextseq_071122/v2_expression_for_reproducibility.rds') %>% 
+    mutate(pool = case_when(
+        pool == 'P1' ~ 'P3',
+        pool == 'P2' ~ 'P4',
+        pool == 'P3' ~ 'P5',
+        pool == 'P4' ~ 'P6'
+    ), experiment = 'v2') %>% 
+    bind_rows(read_rds('../Insulator library v1/nextseq_011322/v1_expression_for_reproducibility.rds') %>% mutate(experiment = 'v1')) %>% 
+    dplyr::rename(exp_R1= exp.x, exp_R2 = exp.y) %>% 
+    arrange(pool) %>% 
+    select(gBC, iBC, pool, experiment,exp_R1, exp_R2) %>% 
+    change_iBC_names_table() %>% 
+    mutate_if(is.numeric, round, digits = 4) %>% 
+    write_tsv('supp_table_10-exp_for_reproducibility.tsv')
+```
+
+```{r}
+read_rds('../Insulator library v2/nextseq_071122/v2_expression_for_reproducibility.rds') %>% 
+    mutate(pool = case_when(
+        pool == 'P1' ~ 'P3',
+        pool == 'P2' ~ 'P4',
+        pool == 'P3' ~ 'P5',
+        pool == 'P4' ~ 'P6'
+    )) %>% 
+    bind_rows(read_rds('../Insulator library v1/nextseq_011322/v1_expression_for_reproducibility.rds')) %>% 
+    filter(repressed.x == 'expressed' & repressed.y == 'expressed') %>% 
+    ggplot(aes(exp.x, exp.y)) +
+    geom_pointdensity() +
+    pretty_theme_facet() +
+    facet_wrap(~ pool) +
+    stat_cor() +
+    xlab('rep1 expression') +
+    ylab('rep2 expression') +
+    scale_colour_continuous(low = 'steelblue4', high = 'lightsteelblue1')
+
+ggsave('mpranalyse_figures/reproducibility_by_pool.pdf', width = 12, height = 7)
+```
+
+```{r}
+read_rds('../Insulator library v1/nextseq_011322/v1_combined_unique_locations.rds') %>% 
+    mutate(experiment = 'v1') %>% 
+    bind_rows(read_rds('../Insulator library v2/nextseq_071122/v2_combined_unique_locations.rds') %>% mutate(experiment = 'v2') %>% 
+    mutate(pool = case_when(
+        pool == 'P1' ~ 'P3',
+        pool == 'P2' ~ 'P4',
+        pool == 'P3' ~ 'P5',
+        pool == 'P4' ~ 'P6',
+        pool == 'Px' ~ 'Px'
+    ))) %>% 
+    select(-end) %>% 
+    dplyr::rename(location = start) %>% 
+    arrange(pool) %>% 
+    write_tsv('supp_table_1-all_combined_unique_locations.tsv')
+```
+
+

@@ -1,0 +1,281 @@
+---
+title: "Enformer"
+output: html_document
+date: "2022-10-21"
+---
+
+```{r message=F}
+library(arrow)
+library(ggpointdensity)
+library(tidyverse)
+```
+
+```{r}
+read_parquet_cage_file = function(filename){
+    read_parquet(filename) %>% 
+    select(-iBC, -contains('reg')) %>% 
+    pivot_longer(cols = colnames(select(., contains('CAGE'))),
+                 names_to = c(NA, 'iBC', 'signals_from', NA),
+                 names_sep = '_',
+                 values_to = 'CAGE_pred',
+                 names_repair = 'minimal') %>%
+        select(id, logFC, outlier, direction, iBC, signals_from, CAGE_pred)
+}
+```
+
+```{r}
+empty_cage_pred = read_parquet('../Enformer/CAGE_empty_predictions.parquet') %>% 
+    pivot_longer(cols = colnames(select(., contains('CAGE'))),
+                 names_to = c(NA, 'iBC', 'signals_from', NA),
+                 names_sep = '_',
+                 values_to = 'CAGE_pred',
+                 names_repair = 'minimal') %>% 
+    select(-type)
+A2_cage_pred = read_parquet_cage_file('../Enformer/A2_enformer_cage_predictions.parquet') 
+cHS4_cage_pred = read_parquet_cage_file('../Enformer/cHS4_enformer_cage_predictions.parquet')
+ALOXE3_cage_pred = read_parquet_cage_file('../Enformer/ALOXE3_enformer_cage_predictions.parquet')
+```
+
+```{r}
+all_cage_preds = bind_rows(empty_cage_pred, A2_cage_pred, cHS4_cage_pred, ALOXE3_cage_pred)
+```
+
+```{r}
+all_cage_preds %>% 
+    ggplot(aes(iBC, CAGE_pred)) +
+    geom_violin(fill = 'gray') +
+    pretty_theme() +
+    facet_wrap(~ signals_from)
+```
+
+```{r}
+change_enformer_iBC_names = function(df){
+    df %>% mutate(iBC = case_when(
+        
+        iBC == 'reg' ~ 'empty',
+        iBC == 'a2' ~ 'A2',
+        iBC == 'a2mut' ~ 'A2_mut',
+        iBC == 'aloxe3' ~ 'ALOXE3',
+        iBC == 'aloxe3delta' ~ 'ALOXE3_deltaBbox',
+        iBC == 'chs4' ~ 'cHS4',
+        iBC == 'chs4x3' ~ 'cHS4_x3'
+        ))
+}
+```
+
+```{r}
+all_cage_preds %>% 
+    change_enformer_iBC_names() %>% 
+    inner_join(mpranalyse_plus1_alphas) %>%
+    filter(!is.na(direction)) %>% 
+    filter(signals_from == 'prom') %>% 
+    ggplot(aes(direction, CAGE_pred)) +
+    geom_violin(fill = 'gray') +
+    geom_boxplot(width = 0.1) +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC)
+```
+
+```{r}
+bind_rows(A2_cage_pred, cHS4_cage_pred, ALOXE3_cage_pred) %>% 
+    change_enformer_iBC_names() %>% 
+    # change_iBC_names() %>% 
+    arrange_ins() %>% 
+    inner_join(empty_cage_pred %>% rename(empty_cage = CAGE_pred), by = c('id', 'signals_from')) %>% 
+    filter(signals_from == 'lp') %>% 
+    filter(iBC.x != 'no insulator', direction != 'downregulated') %>% 
+    change_pool_name() %>% 
+    dplyr::rename(iBC = iBC.x, pred_insulator_CAGE = CAGE_pred, 
+                  pred_uninsulated_cage = empty_cage, log2FC = logFC) %>% 
+    select(gBC, iBC, pool, experiment, pred_insulator_CAGE, pred_uninsulated_cage, log2FC) %>% 
+    mutate_if(is.numeric, round, digits = 4) %>% 
+    write_tsv('supp_table_6-pred_cage_upreg.tsv')
+```
+
+```{r}
+bind_rows(A2_cage_pred, cHS4_cage_pred, ALOXE3_cage_pred) %>% 
+    change_enformer_iBC_names() %>% 
+    # change_iBC_names() %>% 
+    arrange_ins() %>% 
+    inner_join(empty_cage_pred %>% rename(empty_cage = CAGE_pred), by = c('id', 'signals_from')) %>% 
+    filter(signals_from == 'lp') %>% 
+    filter(iBC.x != 'no insulator', direction != 'downregulated') %>% 
+    mutate(pred_fc = CAGE_pred - empty_cage) %>% 
+    ggplot(aes(direction, pred_fc, fill = direction)) +
+    geom_violin() +
+    geom_boxplot(width = 0.1, fill = 'white') +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC.x, nrow = 1) +
+    geom_signif(comparisons = list(c('unchanged', 'upregulated'))) +
+    scale_fill_manual(values = c('darkgray','#87562f')) +
+    theme(legend.position = 'none')
+
+ggsave('mpranalyse_figures/upreg_predicted_fold_changes_by_direction.pdf', width = 6, height = 5)
+```
+
+Insulator modifications
+
+```{r}
+ins_mods = read_parquet('../Enformer/ins_mods.parquet') %>% 
+    select(-contains('index')) %>% 
+    change_enformer_iBC_names()
+```
+
+```{r}
+inner_join(ins_mods, exp_with_mpranalyse_outliers) %>% 
+    ggplot(aes(direction, log2(dnase))) +
+    geom_violin(fill = 'gray') +
+    geom_boxplot(width = 0.1) +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC)
+```
+
+H3K27me3
+
+```{r}
+pred_H3K27me3 = read_parquet('../Enformer/LP_H3K27me3_predictions.parquet') %>% 
+    select(-contains('index')) %>% 
+    change_enformer_iBC_names()
+```
+
+```{r}
+inner_join(pred_H3K27me3, exp_with_mpranalyse_outliers) %>%
+    filter(iBC != 'cHS4' & direction != 'downregulated') %>% 
+    split(.$iBC) %>% 
+    map(function(x){mutate(x, flanks_sum = scale(flanks_sum))}) %>% 
+    reduce(bind_rows) %>% 
+    ggplot(aes(direction, flanks_sum, fill = direction)) +
+    geom_violin() +
+    geom_boxplot(width = 0.1, fill = 'white') +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC) +
+    geom_signif(comparisons = list(c('unchanged', 'upregulated'))) +
+    scale_fill_manual(values = c('darkgray','#87562f')) +
+    theme(legend.position = 'none') +
+    ylim(-2, 6.4)
+
+ggsave('mpranalyse_figures/predicted_upreg_flanks_H3K27me3.pdf', width = 5, height = 4)
+```
+
+```{r}
+library(ggrastr)
+library(ggpointdensity)
+library(ggpubr)
+``
+
+```{r}
+pred_H3K27me3 %>% 
+    filter(iBC != 'cHS4') %>% 
+    split(.$iBC) %>%
+    map(function(x){mutate(x, lp_sum = scale(lp_sum), flanks_sum = scale(flanks_sum))}) %>%
+    reduce(bind_rows) %>% 
+    mutate(iBC = factor(iBC, levels = c('empty', 'A2', 'ALOXE3'))) %>% 
+    ggplot(aes(flanks_sum, lp_sum)) +
+    rasterise(geom_point(), layer = 'point', dpi = 600) +
+    facet_wrap(~ iBC) +
+    pretty_theme_facet() +
+    stat_cor(method = "pearson") 
+
+ggsave('mpranalyse_figures/flank_lp_correlation.pdf', width = 8, height = 5)
+```
+
+```{r}
+inner_join(pred_H3K27me3, exp_with_mpranalyse_outliers) %>% 
+    filter(iBC == 'ALOXE3') %>% 
+    ggplot(aes(lp_sum, flanks_sum, col = direction)) +
+    geom_point() +
+    pretty_theme_facet() +
+    facet_wrap(~ direction) +
+    geom_smooth(method = 'lm', col = 'gray10') +
+    scale_color_manual(values = c('#87562f', 'darkgray', '#214E34')) +
+    theme(legend.position = 'none')
+```
+
+```{r}
+tmp = inner_join(pred_H3K27me3, exp_with_mpranalyse_outliers) %>% 
+    filter(iBC != 'cHS4') %>% 
+    split(.$iBC) %>% 
+    map(~ mutate(.x, H3K27me3_flanks = scale(flanks_sum)[,1], H3K27me3_LP = scale(lp_sum)[,1])) %>% 
+    reduce(bind_rows) %>% 
+    change_pool_name() %>% 
+    select(gBC, iBC, pool, experiment, direction, H3K27me3_flanks, H3K27me3_LP) %>%
+    mutate_if(is.numeric, round, digits = 4) %>%
+    write_tsv('supp_table_7-pred_h3k27me3.tsv')
+```
+
+```{r}
+pred_H3K27me3_joined = inner_join(pred_H3K27me3, exp_with_mpranalyse_outliers) %>% 
+    filter(iBC == 'A2') %>% 
+    mutate(flanks_sum = scale(flanks_sum), lp_sum = scale(lp_sum))
+
+pred_H3K27me3_joined %>% 
+    filter(direction == 'unchanged') %>% 
+    ggplot(aes(lp_sum, flanks_sum)) +
+    rasterise(geom_point(col = 'darkgray', alpha = 0.5), layer = 'point', dpi = 600) +
+    rasterise(geom_point(data = pred_H3K27me3_joined %>% filter(direction == 'upregulated'), aes(lp_sum, flanks_sum, col = direction),
+               alpha = 0.8), layer = 'point', dpi = 600) +
+    pretty_theme() +
+    # stat_cor() +
+    # facet_wrap(~ direction) +
+    geom_smooth(method = 'lm', col = 'gray50') +
+    geom_smooth(data = pred_H3K27me3_joined %>% filter(direction == 'upregulated'), aes(lp_sum, flanks_sum, col = direction),
+                method = 'lm') +
+    scale_color_manual(values = c('#214E34'))
+
+ggsave('mpranalyse_figures/A2_pred_by_direction.pdf', width = 7, height = 5)
+```
+
+```{r}
+library(EnrichedHeatmap)
+```
+
+```{r}
+generate_pred_H3K27me3_mat = function(df){
+    df %>% 
+        inner_join(exp_with_mpranalyse_outliers) %>% 
+        column_to_rownames('id') %>%
+        select(seq(420, 479)) %>% 
+        as.matrix()
+}
+```
+
+```{r}
+get_pred_H3K27me3_directions = function(df){
+    df %>% 
+        inner_join(exp_with_mpranalyse_outliers) %>% 
+        select(id, direction) 
+}
+```
+
+```{r}
+full_pred_h3k27me3_signals = read_parquet('../Enformer/full_H3K27me3_matrices.parquet') %>% 
+    change_enformer_iBC_names() %>% 
+    split(.$iBC)
+```
+
+```{r}
+pred_h3k27me3_mats = full_pred_h3k27me3_signals %>% 
+    map(~ generate_pred_H3K27me3_mat(.x))
+```
+
+```{r}
+pred_h3k27me3_direction = full_pred_h3k27me3_signals %>% 
+    map(~ get_pred_H3K27me3_directions(.x))
+```
+
+```{r}
+attr(pred_h3k27me3_mats$A2, "upstream_index") = 1:30
+attr(pred_h3k27me3_mats$A2, "target_index") = integer(0)
+attr(pred_h3k27me3_mats$A2, "downstream_index") = 31:60
+attr(pred_h3k27me3_mats$A2, "extend") = c(5000, 5000)
+class(pred_h3k27me3_mats$A2) = c("normalizedMatrix", "matrix")
+```
+
+```{r}
+ht = EnrichedHeatmap(pred_h3k27me3_mats$A2,
+                     name = 'A2')
+
+draw(ht, split = pred_h3k27me3_direction$A2)
+```
+
+

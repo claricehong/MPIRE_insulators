@@ -1,0 +1,654 @@
+---
+title: "Untitled"
+output: html_document
+date: "2022-09-02"
+---
+
+```{r message=F}
+library(eulerr)
+library(arrow)
+library(corrplot)
+library(ComplexHeatmap)
+library(tidyverse)
+```
+
+```{r}
+all_TF_counts = read_parquet('htcf_mapped_files/all_TF_10kb_counts.parquet') %>% 
+    rename('id' = '__index_level_0__') %>% 
+    pivot_longer(cols = colnames(select(., -id)), names_to = 'TF', values_to = 'peak_count') %>% 
+    mutate(peak_count = as.numeric(peak_count)) %>% 
+    mutate(peak_overlap = case_when(
+        peak_count == 0 ~ FALSE,
+        TRUE ~ TRUE
+    )) %>% 
+    filter(!TF %in% c('NR2F1', 'TCF7L2'))
+```
+
+```{r}
+all_TF_counts_per_loc = all_TF_counts %>% 
+    group_by(id) %>% 
+    summarise(total_peaks = sum(peak_count))
+```
+
+```{r}
+# from http://www.sthda.com/english/wiki/chi-square-test-of-independence-in-r
+perform_chisq = function(df){
+
+    chisq_res = df %>%
+    dplyr::count(direction, peak_overlap) %>% 
+    pivot_wider(names_from = direction, id_cols = peak_overlap, values_from = n) %>% 
+    column_to_rownames('peak_overlap') %>% 
+    mutate_all(~replace_na(.x, 0)) %>% 
+    chisq.test()
+    
+    contrib = 100*chisq_res$residuals^2/chisq_res$statistic
+    as_tibble(round(chisq_res$residuals, 2)) %>%
+        mutate(TF = df$TF[[1]], chi_p = chisq_res$p.value,
+               iBC = df$iBC[[1]]) %>% 
+        rownames_to_column('peak_overlap')
+    
+    # tribble(~TF, ~chi_p,
+    #         df$TF[[1]], chisq_res$p.value)
+}
+```
+
+```{r}
+calculate_chisq_per_iBC = function(df, selected_direction){
+    
+    all_chi_ps = df %>% 
+    inner_join(all_TF_counts) %>% 
+    filter(direction %in% c(selected_direction, 'unchanged')) %>% 
+    split(.$TF) %>% 
+    map(~perform_chisq(.x)) %>%
+    reduce(bind_rows) 
+    
+    distinct_ps = all_chi_ps %>% 
+        distinct(TF, chi_p)
+    
+    adjusted_chi_ps = p.adjust(distinct_ps$chi_p, method = 'fdr')
+    
+    all_chi_ps %>%
+    mutate(chi_p_adj = rep(adjusted_chi_ps, each = 2)) %>%
+    filter(chi_p_adj < 0.05)
+}
+```
+
+```{r}
+significant_downregulated_TFs_per_iBC = exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>% 
+    map(~calculate_chisq_per_iBC(.x, 'downregulated'))
+
+significant_upregulated_TFs_per_iBC = exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>% 
+    map(~calculate_chisq_per_iBC(.x, 'upregulated'))
+```
+
+```{r}
+pdf('mpranalyse_figures/enriched TF overlap -2TFs.pdf', width = 3, height = 3)
+
+euler_list = list('A2' = unique(significant_downregulated_TFs_per_iBC$A2$TF),
+                  'ALOXE3' = unique(significant_downregulated_TFs_per_iBC$ALOXE3$TF),
+                  'cHS4' = unique(significant_downregulated_TFs_per_iBC$cHS4$TF)) 
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE, fill =  c("#B7990D", "#8cada7", "#a05c7b"))
+dev.off()
+```
+
+```{r}
+compare_ins_chisq = function(df){
+    chisq_res = df %>% 
+        dplyr::count(iBC, peak_overlap) %>% 
+        pivot_wider(names_from = iBC, values_from = n, id_cols = peak_overlap) %>% 
+        column_to_rownames('peak_overlap') %>%
+        mutate_all(~replace_na(.x, 0)) %>%
+        chisq.test()
+
+    contrib = 100*chisq_res$residuals^2/chisq_res$statistic
+    as_tibble(round(chisq_res$residuals, 2)) %>%
+        mutate(TF = df$TF[[1]], chi_p = chisq_res$p.value,
+               direction = df$direction[[1]]) %>%
+        rownames_to_column('peak_overlap')
+}
+```
+
+```{r}
+run_compare_ins_chisq = function(selected_direction, TF_file, fxn){
+    all_chi_ps =
+        exp_with_mpranalyse_outliers %>% 
+        filter(iBC %in% insulators) %>%
+        # filter(iBC %in% c('cHS4', 'ALOXE3')) %>% 
+        filter(direction == selected_direction) %>% 
+        anti_join(locs_ins_all_same_dir %>% filter(direction == selected_direction)) %>% 
+        inner_join(TF_file) %>%
+        split(.$TF) %>%
+        map(~ fxn(.x)) %>%
+        reduce(bind_rows)
+    
+    distinct_ps = all_chi_ps %>%
+        distinct(TF, chi_p)
+
+    adjusted_chi_ps = p.adjust(distinct_ps$chi_p, method = 'fdr')
+
+    all_chi_ps %>%
+        mutate(chi_p_adj = rep(adjusted_chi_ps, each = 2)) #%>%
+    #   filter(chi_p_adj < 0.1)
+}
+```
+
+```{r warning=FALSE}
+upregulated_signif_TFs = run_compare_ins_chisq('upregulated', all_TF_counts, compare_ins_chisq)
+downregulated_signif_TFs = run_compare_ins_chisq('downregulated', all_TF_counts, compare_ins_chisq) 
+```
+
+```{r}
+downregulated_signif_TFs %>% 
+    filter(chi_p_adj < 0.05)
+```
+
+```{r}
+upregulated_signif_TFs %>% 
+    filter(chi_p_adj < 0.05) %>% 
+    mutate(TF = case_when(
+        peak_overlap == 1 ~ paste0(TF, '_absent'),
+        peak_overlap == 2 ~ paste0(TF, '_present')
+    )) %>% 
+    select(TF, A2, ALOXE3, cHS4) %>%
+    column_to_rownames('TF') %>% 
+    as.matrix() %>%
+    t() %>%
+    corrplot(is.corr = FALSE)
+```
+
+```{r}
+downregulated_signif_TFs %>% 
+    mutate(TF = case_when(
+        peak_overlap == 1 ~ paste0(TF, '_absent'),
+        peak_overlap == 2 ~ paste0(TF, '_present')
+    )) %>% 
+    select(TF, A2, ALOXE3, cHS4) %>%
+    column_to_rownames('TF') %>% 
+    as.matrix() %>%
+    t() %>%
+    corrplot(is.corr = FALSE)
+```
+
+```{r}
+downregulated_signif_TFs %>% 
+    distinct(TF) %>% 
+    write_tsv('iBC_downregulated_comp_signif_TFs.tsv', col_names = FALSE)
+```
+
+Looped enhancers
+
+```{r}
+looped_enhancers_TF_overlap =
+    read_parquet('looped_enhancer_bedfiles/mapped_TF_signals/looped_enhancers_TF_distinct_counts.parquet') %>% 
+    rename('chromHMM.id2' = '__index_level_0__') %>%
+    pivot_longer(cols = colnames(select(., -chromHMM.id2, -iBC)), names_to = 'TF', values_to = 'peak_count') %>%
+    mutate(peak_overlap = case_when(
+        peak_count == 0 ~ FALSE,
+        TRUE ~ TRUE
+    )) %>%
+    filter(!TF %in% c('NR2F1', 'TCF7L2'))
+
+compiled_enhancers_TF_overlap =
+    read_parquet('looped_enhancer_bedfiles/mapped_TF_signals/compiled_eRNA_looped_enhancers_distinct_TF_counts.parquet') %>% 
+        rename('compiled_enhancers.id2' = '__index_level_0__') %>% 
+    pivot_longer(cols = colnames(select(., -compiled_enhancers.id2, -iBC)), names_to = 'TF', values_to = 'peak_count') %>% 
+    mutate(peak_overlap = case_when(
+        peak_count == 0 ~ FALSE,
+        TRUE ~ TRUE
+    )) %>% 
+    filter(!TF %in% c('NR2F1', 'TCF7L2'))
+```
+
+```{r}
+looped_enhancers_TF_overlap |> 
+  filter(peak_count > 1) |> 
+  inner_join(interesting_TFs)
+```
+
+```{r}
+calculate_looped_chisq_per_iBC = function(df, selected_direction, enh_overlap_df, var){
+    
+    all_chi_ps = df %>% 
+    inner_join(enh_overlap_df, by = c('iBC', var)) %>% 
+    filter(direction %in% c(selected_direction, 'unchanged')) %>% 
+    split(.$TF) %>% 
+    map(~perform_chisq(.x)) %>%
+    reduce(bind_rows)
+    
+    distinct_ps = all_chi_ps %>% 
+    distinct(TF, chi_p)
+    
+    adjusted_chi_ps = p.adjust(distinct_ps$chi_p, method = 'fdr')
+    
+    all_chi_ps %>%
+    mutate(chi_p_adj = rep(adjusted_chi_ps, each = 2)) %>%
+    filter(chi_p_adj < 0.05)
+}
+```
+
+```{r}
+looped_upregulated_differences = exp_deseq_outliers_looped_enhancer_locs %>% 
+    map(~ calculate_looped_chisq_per_iBC(.x, 'upregulated', looped_enhancers_TF_overlap, 'chromHMM.id2')) %>% 
+    reduce(bind_rows)
+
+looped_downregulated_differences = exp_deseq_outliers_looped_enhancer_locs %>% 
+    map(~ calculate_looped_chisq_per_iBC(.x, 'downregulated', looped_enhancers_TF_overlap, 'chromHMM.id2')) %>% 
+    reduce(bind_rows)
+```
+
+```{r}
+compiled_enh_looped_upregulated_differences = 
+    compiled_enhancers_looped_with_outliers %>% 
+    map(~ calculate_looped_chisq_per_iBC(.x, 'upregulated', compiled_enhancers_TF_overlap, 'compiled_enhancers.id2')) %>% 
+    reduce(bind_rows)
+
+compiled_enh_looped_downregulated_differences = 
+    compiled_enhancers_looped_with_outliers %>% 
+    map(~ calculate_looped_chisq_per_iBC(.x, 'downregulated', compiled_enhancers_TF_overlap, 'compiled_enhancers.id2')) %>% 
+    reduce(bind_rows)
+```
+
+```{r}
+# png('figures/A2_mut_mpranalyse_deseq_outlier_overlap.png', res = 300, width = 7, height = 7, units = 'in')
+
+looped_downregulated_differences_per_iBC = looped_downregulated_differences %>% split(.$iBC)
+
+euler_list = list('A2' = unique(looped_downregulated_differences_per_iBC$A2$TF),
+                  'ALOXE3' = unique(looped_downregulated_differences_per_iBC$ALOXE3$TF),
+                  'cHS4' = unique(looped_downregulated_differences_per_iBC$cHS4$TF)) 
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE, fill =  c("#B7990D", "#8cada7", "#a05c7b"))
+# dev.off()
+```
+
+```{r}
+reduce(exp_deseq_outliers_looped_enhancer_locs, bind_rows) %>% 
+        change_iBC_names() %>% 
+    filter(iBC %in% c('cHS4 mut', 'A2 mut'))
+```
+
+```{r}
+run_compare_looped_ins_chisq = function(selected_direction, counts_df, comp_ins, enh_overlap_df, var){
+    all_chi_ps =
+        reduce(enh_overlap_df, bind_rows) %>% 
+        filter(iBC %in% comp_ins) %>%
+        filter(direction == selected_direction) %>%
+      # anti_join(locs_ins_all_same_dir %>% filter(direction == selected_direction)) %>%
+        inner_join(counts_df, by = c('iBC', var)) %>%
+        change_iBC_names() %>% 
+        split(.$TF) %>%
+        map(~ compare_ins_chisq(.x)) %>%
+        reduce(bind_rows)
+
+    distinct_ps = all_chi_ps %>%
+        distinct(TF, chi_p)
+
+    adjusted_chi_ps = p.adjust(distinct_ps$chi_p, method = 'fdr')
+
+    all_chi_ps %>%
+        mutate(chi_p_adj = rep(adjusted_chi_ps, each = 2)) %>%
+        filter(chi_p_adj < 0.05)
+}
+```
+
+```{r}
+looped_upreg_comp_differences = run_compare_looped_ins_chisq('upregulated', looped_enhancers_TF_overlap, c('cHS4', 'A2', 'ALOXE3'), exp_deseq_outliers_looped_enhancer_locs, 'chromHMM.id2')
+
+looped_downreg_comp_differences = run_compare_looped_ins_chisq('downregulated', looped_enhancers_TF_overlap, c('cHS4', 'A2', 'ALOXE3'), exp_deseq_outliers_looped_enhancer_locs, 'chromHMM.id2')
+```
+
+```{r}
+compiled_enh_looped_upreg_comp_differences = run_compare_looped_ins_chisq('upregulated', compiled_enhancers_TF_overlap, c('cHS4', 'A2', 'ALOXE3'), compiled_enhancers_looped_with_outliers, 'compiled_enhancers.id2')
+
+compiled_enh_looped_downreg_comp_differences = run_compare_looped_ins_chisq('downregulated', compiled_enhancers_TF_overlap, c('cHS4', 'A2', 'ALOXE3'), compiled_enhancers_looped_with_outliers, 'compiled_enhancers.id2')
+```
+
+```{r}
+interesting_TFs = bind_rows(looped_downreg_comp_differences, compiled_enh_looped_downreg_comp_differences) |> 
+    distinct(TF)
+
+# interesting_TFs |> write_tsv('looped_downregulated_TFs_all.tsv')
+```
+
+```{r}
+# pdf('mpranalyse_figures/compiled enh looped downregulated distinct TF peak comparisons long.pdf', width = 9, height = 9)
+pdf('mpranalyse_figures/looped downregulated distinct TF peak comparisons.pdf', width = 9, height = 9)
+tmp = looped_downreg_comp_differences %>% 
+    # mutate(TF = case_when(
+    #     peak_overlap == 1 ~ paste0(TF, '_absent'),
+    #     peak_overlap == 2 ~ paste0(TF, '_present')
+    # )) %>%
+    filter(peak_overlap == 2) %>% 
+    select(TF, cHS4, A2, ALOXE3) %>%
+    column_to_rownames('TF') %>%
+    as.matrix()
+
+ht = Heatmap(tmp)
+ht = draw(ht)
+
+corrplot(tmp[row_order(ht), ], is.corr = FALSE, tl.col = 'black', cl.pos = 'b', tl.srt = 45)
+dev.off()
+```
+
+```{r}
+pdf('mpranalyse_figures/chromHMM_eRNA_TF_overlap.pdf', width = 7, height = 7)
+
+euler_list = list('chromHMM enhancers' = unique(looped_downreg_comp_differences$TF),
+            'eRNA enhancers' = unique(compiled_enh_looped_downreg_comp_differences$TF)) 
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE, fill =  c("lightgray", "gray70"))
+
+dev.off()
+```
+
+```{r}
+1 - phyper(16, 47, 112-47, 22)
+```
+
+```{r}
+# png('figures/A2_mut_mpranalyse_deseq_outlier_overlap.png', res = 300, width = 7, height = 7, units = 'in')
+
+euler_list = list('nearby' = unique(upregulated_signif_TFs$TF),
+                  'looped' = unique(looped_upreg_comp_differences$TF))
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE)
+# dev.off()
+```
+
+```{r}
+# upregulated overlap
+fisher_mat = matrix(c(8, 34, 11, 114-8-34-11), nrow = 2, ncol = 2)
+fisher.test(fisher_mat)
+
+# downregulated overlap
+fisher_mat = matrix(c(7, 29, 8, 114-7-29-8), nrow = 2, ncol = 2)
+fisher.test(fisher_mat)
+```
+
+Motif counts
+
+```{r}
+# all_fimo_counts = read_tsv('all_locs_fimo_scan.tsv', show_col_types = FALSE, comment = '#') %>%
+#     separate(sequence_name, sep = '::', into = c('id', NA)) %>%
+#     count(id, motif_id)
+```
+
+```{r}
+all_fimo_counts %>% 
+    write_tsv('all_locs_fimo_counts.tsv')
+```
+
+```{r}
+all_fimo_counts_binarised =
+    read_tsv('all_locs_fimo_counts.tsv', show_col_types = FALSE) %>% 
+    pivot_wider(id_cols = id, names_from = motif_id, values_from = n) %>% 
+    filter(!is.na(id)) %>% 
+    mutate_if(is.numeric, ~ replace_na(.x, 0)) %>%
+    pivot_longer(cols = colnames(dplyr::select(., contains('_'))), names_to = 'motif_id', values_to = 'peak_count') %>% 
+    mutate(peak_overlap = case_when(
+        peak_count == 0 ~ FALSE,
+        TRUE ~ TRUE
+    )) %>% 
+    separate(motif_id, sep = '_', into = c('TF', NA))
+```
+
+```{r}
+upregulated_signif_motifs = run_compare_ins_chisq('upregulated', all_fimo_counts_binarised, compare_ins_chisq)
+downregulated_signif_motifs = run_compare_ins_chisq('downregulated', all_fimo_counts_binarised, compare_ins_chisq)
+```
+
+```{r}
+downregulated_signif_motifs %>% 
+    filter(chi_p_adj < 0.05)
+```
+
+
+```{r}
+downregulated_signif_motifs %>% 
+    filter(chi_p_adj < 0.05) %>% 
+    mutate(TF = case_when(
+        peak_overlap == 1 ~ paste0(TF, '_absent'),
+        peak_overlap == 2 ~ paste0(TF, '_present')
+    )) %>% 
+    select(TF, all_of(mutants)) %>%
+    column_to_rownames('TF') %>% 
+    as.matrix() %>%
+    t() %>%
+    corrplot(is.corr = FALSE)
+```
+
+```{r}
+upreg_enhancer_fimo_files = fs::dir_ls(path = 'looped_enhancer_bedfiles/fimo_scans/', glob = '*upregulated_fimo.tsv') %>%
+    as.character() %>%
+    purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_upregulated_fimo.tsv') - 1)
+    })
+
+downreg_enhancer_fimo_files = fs::dir_ls(path = 'looped_enhancer_bedfiles/fimo_scans/', glob = '*downregulated_fimo.tsv') %>%
+    as.character() %>%
+    purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_downregulated_fimo.tsv') - 1)
+    })
+```
+
+```{r}
+compiled_enh_upreg_enhancer_fimo_files = fs::dir_ls(path = 'looped_enhancer_bedfiles/compiled_eRNA_fimo_scans/', glob = '*upregulated_fimo.tsv') %>%
+    as.character() %>%
+    purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_upregulated_fimo.tsv') - 1)
+    })
+
+compiled_enh_downreg_enhancer_fimo_files = fs::dir_ls(path = 'looped_enhancer_bedfiles/compiled_eRNA_fimo_scans/', glob = '*downregulated_fimo.tsv') %>%
+    as.character() %>%
+    purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_downregulated_fimo.tsv') - 1)
+    })
+```
+
+```{r}
+get_enhancer_fimo_counts = function(filenames, id_name){
+    names(filenames) %>% 
+    map(~read_tsv(filenames[[.x]], comment = '#', show_col_types = FALSE) %>% 
+            mutate(iBC = .x)) %>% 
+    reduce(bind_rows) %>% 
+    # filter(iBC %in% insulators) %>%
+    separate(sequence_name, sep = '::', into = c(id_name, NA)) %>%
+    separate(motif_id, sep = '_', into = c('TF', NA)) %>%
+    dplyr::count(TF, !!ensym(id_name), iBC) %>% 
+    pivot_wider(id_cols = c(id_name, iBC), names_from = 'TF', values_from = 'n') %>%
+    mutate_if(is.numeric, ~ replace_na(.x, 0)) %>%
+    pivot_longer(cols = colnames(select(., -id_name, -iBC)), names_to = 'TF', values_to = 'peak_count') %>%
+    mutate(peak_overlap = case_when(
+        peak_count == 0 ~ FALSE,
+        TRUE ~ TRUE
+    ))
+}
+```
+
+```{r}
+read_tsv(filenames[[.x]], comment = '#', show_col_types = FALSE)
+```
+
+```{r}
+upreg_enhancer_fimo_counts = get_enhancer_fimo_counts(upreg_enhancer_fimo_files, 'enhancer.id2')
+downreg_enhancer_fimo_counts = get_enhancer_fimo_counts(downreg_enhancer_fimo_files, 'enhancer.id2')
+```
+
+```{r}
+compiled_enh_upreg_enhancer_fimo_counts = get_enhancer_fimo_counts(compiled_enh_upreg_enhancer_fimo_files, 'compiled_enhancers.id2')
+compiled_enh_downreg_enhancer_fimo_counts = get_enhancer_fimo_counts(compiled_enh_downreg_enhancer_fimo_files, 'compiled_enhancers.id2')
+```
+
+```{r}
+looped_upreg_signif_fimo = run_compare_looped_ins_chisq('upregulated', upreg_enhancer_fimo_counts, c('cHS4_x3', 'A2_mut', 'ALOXE3_deltaBbox'), exp_deseq_outliers_looped_enhancer_locs, 'chromHMM.id2')
+looped_downreg_signif_fimo = run_compare_looped_ins_chisq('downregulated', downreg_enhancer_fimo_counts, c('cHS4_x3', 'A2_mut', 'ALOXE3_deltaBbox'), exp_deseq_outliers_looped_enhancer_locs, 'chromHMM.id2')
+```
+
+```{r}
+compiled_enh_looped_upreg_signif_fimo = run_compare_looped_ins_chisq('upregulated', compiled_enh_upreg_enhancer_fimo_counts, c('cHS4', 'A2', 'ALOXE3'), compiled_enhancers_looped_with_outliers, 'compiled_enhancers.id2')
+
+compiled_enh_looped_downreg_signif_fimo = run_compare_looped_ins_chisq('downregulated', compiled_enh_downreg_enhancer_fimo_counts, c('cHS4', 'A2', 'ALOXE3'), compiled_enhancers_looped_with_outliers, 'compiled_enhancers.id2')
+```
+
+```{r}
+# pdf('mpranalyse_figures/looped upregulated TF motif comparisons long.pdf', width = 7, height = 9)
+# png('mpranalyse_figures/looped downregulated TF peak comparisons.png', width = 9, height = 7, units = 'in', res = 300)
+tmp = compiled_enh_looped_upreg_signif_fimo %>% 
+    # mutate(TF = case_when(
+    #     peak_overlap == 1 ~ paste0(TF, '_absent'),
+    #     peak_overlap == 2 ~ paste0(TF, '_present')
+    # )) %>%
+    filter(peak_overlap == 2) %>% 
+    select(TF, cHS4, A2, ALOXE3) %>%
+    column_to_rownames('TF') %>%
+    as.matrix()
+
+ht = Heatmap(tmp)
+ht = draw(ht)
+
+corrplot(tmp[row_order(ht), ], is.corr = FALSE, tl.col = 'black', cl.pos = 'b', tl.srt = 45)
+# dev.off()
+```
+
+```{r}
+euler_list = list('chip' = unique(looped_downreg_comp_differences$TF),
+                  'fimo' = unique(looped_downreg_signif_fimo$TF))
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE)
+```
+
+Insulator motifs
+
+```{r}
+read_tsv('../insulator_motif_overlap.tsv') %>% 
+    distinct(sequence_name, motif_id) %>%
+    filter(sequence_name %in% insulators) %>% 
+    mutate(sequence_name = factor(sequence_name, levels = c('A2', 'cHS4', 'ALOXE3'))) %>%  
+    ggplot(aes(sequence_name, fill = sequence_name)) +
+    geom_bar(col = 'black') +
+    pretty_theme() +
+    xlab('') +
+    ylab('number of motifs') +
+    scale_y_continuous(expand = c(0,0), limits = c(0, 70)) + 
+    scale_fill_manual(values = c('#b7990d', '#a05c7b', '#8cada7')) +
+    theme(legend.position = 'none')
+
+ggsave('mpranalyse_figures/insulator_motif_counts.pdf', width = 4, height = 5)
+```
+
+Check whether the TFs are expressed
+
+```{r}
+all_expressed_genes_name =
+    read_tsv('../../Core promoters TRIP/Genome annotations/RNA-seq/K562_expressed_genes_name.tsv', col_names = 'TF', show_col_types = FALSE)
+```
+
+```{r}
+all_TF_counts %>% 
+    distinct(TF) %>% 
+    mutate(expressed = case_when(
+        TF %in% all_expressed_genes_name$TF ~ TRUE,
+        TRUE ~ FALSE)) %>% 
+    filter(expressed == FALSE)
+```
+
+Revision 2 (upstream only)
+
+```{r}
+upstream_only_looped_enhancers_TF_overlap =
+    read_parquet('looped_enhancer_bedfiles/mapped_TF_signals/upstream_only_looped_enhancers_distinct_TF_counts.parquet') %>% 
+    rename('chromHMM.id2' = '__index_level_0__') %>%
+    pivot_longer(cols = colnames(select(., -chromHMM.id2, -iBC)), names_to = 'TF', values_to = 'peak_count') %>%
+    mutate(peak_overlap = case_when(
+        peak_count == 0 ~ FALSE,
+        TRUE ~ TRUE
+    )) %>%
+    filter(!TF %in% c('NR2F1', 'TCF7L2'))
+```
+
+```{r}
+upstream_only_looped_upregulated_differences = exp_deseq_outliers_looped_enhancer_locs %>% 
+    map(~ calculate_looped_chisq_per_iBC(.x, 'upregulated', upstream_only_looped_enhancers_TF_overlap, 'chromHMM.id2')) %>% 
+    reduce(bind_rows)
+
+upstream_only_looped_downregulated_differences = exp_deseq_outliers_looped_enhancer_locs %>% 
+    map(~ calculate_looped_chisq_per_iBC(.x, 'downregulated', upstream_only_looped_enhancers_TF_overlap, 'chromHMM.id2')) %>% 
+    reduce(bind_rows)
+```
+
+```{r}
+upstream_only_looped_upreg_comp_differences = run_compare_looped_ins_chisq('upregulated', upstream_only_looped_enhancers_TF_overlap, c('cHS4', 'A2', 'ALOXE3'), exp_deseq_outliers_looped_enhancer_locs, 'chromHMM.id2')
+
+upstream_only_looped_downreg_comp_differences = run_compare_looped_ins_chisq('downregulated', upstream_only_looped_enhancers_TF_overlap, c('cHS4', 'A2', 'ALOXE3'), exp_deseq_outliers_looped_enhancer_locs, 'chromHMM.id2')
+```
+
+```{r}
+pdf('mpranalyse_figures/upstream only looped downregulated distinct TF peak comparisons.pdf', width = 9, height = 9)
+tmp = upstream_only_looped_downreg_comp_differences %>% 
+    # mutate(TF = case_when(
+    #     peak_overlap == 1 ~ paste0(TF, '_absent'),
+    #     peak_overlap == 2 ~ paste0(TF, '_present')
+    # )) %>%
+    filter(peak_overlap == 2) %>% 
+    select(TF, cHS4, A2, ALOXE3) %>%
+    column_to_rownames('TF') %>%
+    as.matrix()
+
+ht = Heatmap(tmp)
+ht = draw(ht)
+
+corrplot(tmp[row_order(ht), ], is.corr = FALSE, tl.col = 'black', cl.pos = 'b', tl.srt = 45)
+dev.off()
+```
+
+```{r}
+upstream_only_compiled_looped_enhancers_TF_overlap =
+    read_parquet('looped_enhancer_bedfiles/mapped_TF_signals/upstream_only_compiled_looped_enhancers_distinct_TF_counts.parquet') %>% 
+    rename('compiled_enhancers.id2' = '__index_level_0__') %>%
+    pivot_longer(cols = colnames(select(., -compiled_enhancers.id2, -iBC)), names_to = 'TF', values_to = 'peak_count') %>%
+    mutate(peak_overlap = case_when(
+        peak_count == 0 ~ FALSE,
+        TRUE ~ TRUE
+    )) %>%
+    filter(!TF %in% c('NR2F1', 'TCF7L2'))
+```
+
+```{r}
+upstream_only_compiled_looped_upreg_comp_differences = run_compare_looped_ins_chisq('upregulated', upstream_only_compiled_looped_enhancers_TF_overlap, c('cHS4', 'A2', 'ALOXE3'), compiled_enhancers_looped_with_outliers, 'compiled_enhancers.id2')
+
+upstream_only_compiled_looped_downreg_comp_differences = run_compare_looped_ins_chisq('downregulated', upstream_only_compiled_looped_enhancers_TF_overlap, c('cHS4', 'A2', 'ALOXE3'), compiled_enhancers_looped_with_outliers, 'compiled_enhancers.id2')
+```
+
+```{r}
+pdf('mpranalyse_figures/upstream only compiled looped downregulated distinct TF peak comparisons.pdf', width = 9, height = 9)
+tmp = upstream_only_compiled_looped_downreg_comp_differences %>% 
+    # mutate(TF = case_when(
+    #     peak_overlap == 1 ~ paste0(TF, '_absent'),
+    #     peak_overlap == 2 ~ paste0(TF, '_present')
+    # )) %>%
+    filter(peak_overlap == 2) %>% 
+    select(TF, cHS4, A2, ALOXE3) %>%
+    column_to_rownames('TF') %>%
+    as.matrix()
+
+ht = Heatmap(tmp)
+ht = draw(ht)
+
+corrplot(tmp[row_order(ht), ], is.corr = FALSE, tl.col = 'black', cl.pos = 'b', tl.srt = 45)
+# dev.off()
+```
+
+```{r}
+pdf('mpranalyse_figures/chromHMM_eRNA_TF_overlap.pdf', width = 7, height = 7)
+
+euler_list = list('chromHMM enhancers' = unique(upstream_only_looped_downreg_comp_differences$TF),
+            'eRNA enhancers' = unique(upstream_only_compiled_looped_downreg_comp_differences$TF)) 
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE, fill =  c("lightgray", "gray70"))
+
+dev.off()
+```
+

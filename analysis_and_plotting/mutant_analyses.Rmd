@@ -1,0 +1,297 @@
+---
+title: "Untitled"
+output: html_document
+date: "2022-08-10"
+---
+
+```{r message=F}
+library(eulerr)
+library(ggstatsplot)
+library(gginnards)
+library(tidyverse)
+```
+
+```{r}
+# the fold changes of the mutants is not smaller than the non mutants
+# reduce(exp_with_deseq_outliers, bind_rows) %>%
+exp_with_mpranalyse_outliers %>% 
+    filter(outlier == 'insulated') %>% 
+    filter(grepl('ALOXE3', iBC)) %>% 
+    ggplot(aes(abs(logFC), col = iBC)) +
+    geom_density(key_glyph = draw_key_path) +
+    # scale_y_continuous(expand = c(0,0), limits = c(0, 0.42)) +
+    pretty_theme() +
+    theme(legend.position = c(0.7, 0.9), legend.title = element_blank())
+
+ggsave('mpranalyse_figures/ALOXE3_foldchanges.png', width = 7, height = 5)
+```
+
+```{r}
+pdf('mpranalyse_figures/A2_outlier_overlap.pdf', width = 5, height = 5)
+# png('mpranalyse_figures/A2_outlier_overlap.png', res = 300, width = 7, height = 7, units = 'in')
+
+euler_list = list('A2' = get_mpranalyse_iBC('A2', 'downregulated')$id,
+     'A2 mut' = get_mpranalyse_iBC('A2_mut', 'downregulated')$id) 
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE, fill =  c("#B7990D", "#e2d69e"))
+dev.off()
+```
+
+```{r}
+pdf('mpranalyse_figures/cHS4_outlier_overlap.pdf', width = 5, height = 5)
+# png('mpranalyse_figures/cHS4_outlier_overlap.png', res = 300, width = 7, height = 7, units = 'in')
+
+cHS4_v2 = get_mpranalyse_iBC('cHS4', 'downregulated') %>% filter(grepl('v2', id))
+
+euler_list = list('cHS4' = cHS4_v2$id,
+     'cHS4 mut' = get_mpranalyse_iBC('cHS4_x3', 'downregulated')$id) 
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE, fill =  c("#a05c7b", "#cfadbd"))
+dev.off()
+```
+
+```{r}
+pdf('mpranalyse_figures/ALOXE3_outlier_overlap.pdf', width = 5, height = 5)
+# png('mpranalyse_figures/ALOXE3_outlier_overlap.png', res = 300, width = 7, height = 7, units = 'in')
+
+ALOXE3_v2 = get_mpranalyse_iBC('ALOXE3', 'downregulated') %>% filter(grepl('v2', id))
+
+euler_list = list('ALOXE3' = ALOXE3_v2$id,
+     'ALOXE3 mut' = get_mpranalyse_iBC('ALOXE3_deltaBbox', 'downregulated')$id) 
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE, fill =  c("#8cada7", "#c5d6d3"))
+dev.off()
+```
+
+```{r}
+inner_join(exp_with_deseq_outliers$A2, exp_with_deseq_outliers$A2_mut, by = 'id') %>%
+    mutate(shared_outliers = case_when(
+      outlier.x == 'insulated' & outlier.y == 'unchanged' ~ 'rescued',
+      outlier.x == 'insulated' & outlier.y == 'insulated' ~ 'not_rescued',
+      outlier.x == 'unchanged' & outlier.y == 'insulated' ~ 'gained',
+      TRUE ~ 'nothing'
+    )) %>%
+    # count(shared_outliers)
+    filter(outlier.x == 'insulated') %>%
+    # filter(shared_outliers != 'nothing') %>% 
+    ggplot(aes(shared_outliers)) +
+    geom_bar(fill = '#b7990d') +
+    pretty_theme() +
+    xlab('') +
+    scale_y_continuous(expand = c(0,0), limits = c(0, 1199)) +
+    theme(text = element_text(size = 18))
+    # ggbarstats(x = direction, y = shared_outliers)
+
+# ggsave('mpranalyse_figures/A2 mut number rescued.png', width = 3.5, height = 5)
+```
+
+```{r}
+count_rescued = function(ins, mut){
+    
+    if (ins == 'A2'){
+        ins_df = exp_with_mpranalyse_outliers %>% 
+            filter(iBC == ins) %>% 
+            select(id, outlier, direction)}
+    else {
+        ins_df = exp_with_mpranalyse_outliers %>% 
+            filter(iBC == ins & grepl('v2', pool)) %>% 
+            select(id, outlier, direction)}
+    
+    mut_df = exp_with_mpranalyse_outliers %>% 
+        filter(iBC == mut) %>% 
+        select(iBC, id, outlier, direction)
+
+    inner_join(ins_df, mut_df, by = 'id') %>%
+    mutate(shared_outliers = case_when(
+      direction.x != 'unchanged' & direction.y == 'unchanged' ~ 'rescued',
+      outlier.x == 'insulated' & direction.x == direction.y ~ 'not_rescued',
+      direction.x == 'unchanged' & direction.y != 'unchanged' ~ 'gained',
+      outlier.x == 'insulated' & direction.x != direction.y ~ 'opposite',
+      TRUE ~ 'nothing'
+    )) 
+}
+```
+
+```{r}
+rescued_locations = tribble(~ins, ~mut, 'cHS4', 'cHS4_x3', 'A2', 'A2_mut', 'A2', 'A2_scrambled', 'ALOXE3', 'ALOXE3_deltaBbox') %>% 
+    pmap(count_rescued) %>% 
+    reduce(bind_rows) 
+
+p = rescued_locations %>%
+    # filter(outlier.x == 'insulated' & iBC != 'A2_scrambled') %>% 
+    filter(direction.x == 'downregulated' & iBC != 'A2_scrambled') %>% 
+    change_iBC_names() %>% 
+    mutate(shared_outliers = factor(shared_outliers, 
+                                    levels = c('rescued', 'not_rescued', 'opposite'))) %>%  
+    ggbarstats(shared_outliers, iBC,
+               results.subtitle = FALSE,
+               package = 'wesanderson',
+               palette = 'IsleofDogs2') +
+    pretty_theme() +
+    xlab('')
+    # count(iBC, shared_outliers) %>% 
+    # pivot_wider(id_cols = iBC, names_from = shared_outliers, values_from = n) %>% 
+    # mutate(perc_rescued = rescued/(rescued+opposite+not_rescued)) %>% 
+    # ggplot(aes(iBC, perc_rescued, fill = iBC)) +
+    # geom_col() +
+    # pretty_theme() +
+    # xlab('') +
+    # ylab('% locations rescued') +
+    # scale_y_continuous(expand = c(0,0), limits = c(0, 0.84)) +
+    # scale_fill_manual(values = c('#a05c7b', '#b7990d', '#8cada7')) +
+    # theme(legend.position = 'none')
+    
+delete_layers(p, 'GeomText')
+
+ggsave('mpranalyse_figures/percent_rescued_only_per_construct_downreg.pdf', width = 8, height = 7)
+```
+```{r}
+p = rescued_locations %>%
+    filter(iBC == 'A2_scrambled') %>% 
+    change_iBC_names() %>% 
+    mutate(shared_outliers = factor(shared_outliers, 
+                                    levels = c('rescued', 'not_rescued', 'opposite'))) %>%  
+    ggbarstats(shared_outliers, direction.x,
+               results.subtitle = FALSE,
+               package = 'wesanderson',
+               palette = 'IsleofDogs2') +
+    pretty_theme() +
+    xlab('')
+    
+delete_layers(p, 'GeomText')
+
+ggsave('mpranalyse_figures/percent_rescued_only_per_construct_A2scram.pdf', width = 7, height = 7)
+```
+
+```{r}
+rescued_locations %>%
+    filter(outlier.x == 'insulated' & iBC != 'A2_scrambled') %>% 
+    ggplot(aes(direction.x, fill = direction.x)) +
+    geom_bar() +
+    pretty_theme_facet() +
+    facet_wrap(~iBC) +
+    scale_fill_manual(values = c('#87562f', '#214E34')) +
+    xlab('') +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_continuous(expand = c(0,0), limits = c(0, 800))
+
+
+ggsave('mpranalyse_figures/direction of rescued locations.png', width = 8, height = 6)
+```
+
+```{r}
+# the logFC of gained locations is similar 
+rescued_locations %>% 
+    filter(shared_outliers %in% c('gained', 'nothing')) %>%
+    rename(iBC_mut = iBC) %>% 
+    separate(iBC_mut, into = c('iBC', NA), remove = FALSE) %>% 
+    inner_join(exp_with_mpranalyse_outliers %>% select(iBC, id, alpha, logFC)) %>% 
+    ggplot(aes(abs(logFC), col = shared_outliers)) +
+    geom_density() +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC_mut)
+```
+
+```{r}
+rescued_locations %>% 
+    filter(shared_outliers %in% c('gained', 'nothing')) %>%
+    inner_join(mpranalyse_plus1_alphas %>% filter(iBC == 'empty'), by = 'id') %>%
+    ggplot(aes(iBC.x, alpha, fill = shared_outliers)) +
+    geom_boxplot() +
+    pretty_theme()
+```
+
+```{r}
+gained_locations = filter(rescued_locations, shared_outliers == 'gained')
+```
+
+```{r}
+# png('mpranalyse_figures/cHS4_outlier_overlap.png', res = 300, width = 7, height = 7, units = 'in')
+
+euler_list = list('A2_scram' = ,
+                  'A2_mut' = filter(gained_locations, iBC == 'A2_mut')$id,
+                  'ALOXE3' = filter(gained_locations, iBC == 'ALOXE3_deltaBbox')$id,
+                  'cHS4' = filter(gained_locations, iBC == 'cHS4_x3')$id)
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE)
+# dev.off()
+```
+
+```{r}
+gained_locations %>% 
+    ggbarstats(direction.y, iBC)
+```
+
+```{r}
+gained_locations_histones = rescued_locations %>% 
+    filter(shared_outliers %in% c('gained', 'nothing')) %>% 
+    inner_join(both_updown_histones, by = 'id') %>% 
+    group_by(iBC, shared_outliers) %>% 
+    summarise_if(is.double, mean) %>% 
+    mutate(rowname = paste(iBC, shared_outliers, sep = '_')) %>% 
+    column_to_rownames() 
+```
+
+```{r}
+Heatmap(gained_locations_histones %>% 
+    select(-iBC, -shared_outliers),
+    name = 'gained_locations', 
+    show_row_names = FALSE,
+    row_split = gained_locations_histones$iBC,
+    rect_gp = gpar(col = "white", lwd = 2))
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    ggplot(aes(logFC, col = iBC)) +
+    geom_density() +
+    pretty_theme()
+```
+
+
+```{r}
+read_rds('mpranalyse_output/A2_compare_mut_unique_mpranalyze_de.rds') %>% 
+    mutate(iBC = 'A2 mut vs A2') %>% 
+    bind_rows(exp_with_mpranalyse_outliers %>% 
+                  filter(iBC == 'A2') %>% 
+                  mutate(iBC = 'A2 vs empty')) %>% 
+    ggplot(aes(logFC, col = iBC, fill = iBC)) +
+    geom_density(alpha = 0.5) +
+    pretty_theme() +
+    scale_color_manual(values = c('#b7990d', 'darkgray')) +
+    scale_fill_manual(values = c('#b7990d', 'darkgray')) +
+    scale_y_continuous(expand = c(0,0), limits = c(0, 0.42))
+
+ggsave('mpranalyse_figures/A2 mut fold changes.pdf')
+```
+
+```{r}
+read_rds('mpranalyse_output/cHS4_compare_mut_unique_mpranalyze_de.rds') %>% 
+    mutate(iBC = 'cHS4 mut vs cHS4') %>% 
+    bind_rows(exp_with_mpranalyse_outliers %>% filter(iBC == 'cHS4') %>% 
+                  mutate(iBC = 'cHS4 vs empty')) %>% 
+    ggplot(aes(logFC, col = iBC, fill = iBC)) +
+    geom_density(alpha = 0.5) +
+    pretty_theme() +
+    scale_color_manual(values = c('#a05c7b', 'darkgray')) +
+    scale_fill_manual(values = c('#a05c7b', 'darkgray')) +
+    scale_y_continuous(expand = c(0,0), limits = c(0, 0.42))
+
+ggsave('mpranalyse_figures/cHS4 mut fold changes.pdf', width = 8, height = 4.51)
+```
+
+```{r}
+read_rds('mpranalyse_output/ALOXE3_compare_mut_unique_mpranalyze_de.rds') %>% 
+    mutate(iBC = 'ALOXE3 mut vs ALOXE3') %>% 
+    bind_rows(exp_with_mpranalyse_outliers %>% filter(iBC == 'ALOXE3') %>% 
+                  mutate(iBC = 'ALOXE3 vs empty')) %>% 
+    ggplot(aes(logFC, col = iBC, fill = iBC)) +
+    geom_density(alpha = 0.5) +
+    pretty_theme() +
+    scale_color_manual(values = c('#8cada7', 'darkgray')) +
+    scale_fill_manual(values = c('#8cada7', 'darkgray')) +
+    scale_y_continuous(expand = c(0,0), limits = c(0, 0.42))
+
+ggsave('mpranalyse_figures/ALOXE3 mut fold changes.pdf', width = 8.5, height = 4.51)
+```
+

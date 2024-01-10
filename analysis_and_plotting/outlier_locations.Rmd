@@ -1,0 +1,1670 @@
+---
+title: "Untitled"
+output: html_document
+date: "2022-08-02"
+---
+
+```{r message=F}
+library(ggstatsplot)
+library(ggsignif)
+library(gginnards)
+library(GenomicRanges)
+library(GenomicInteractions)
+library(plyranges)
+library(biomaRt)
+library(matrixStats)
+library(tidyverse)
+```
+
+```{r}
+get_distance_to_feature_outliers = function(exp_gr, feature_gr){
+    
+    distances = distanceToNearest(exp_gr, feature_gr)
+    
+    output = as_tibble(exp_gr[queryHits(distances)]) %>%
+        dplyr::select(-end, -width) %>%
+        mutate(distance = mcols(distances)$distance) %>% 
+        mutate(distance = case_when(
+        distance == 0 ~ 0,
+        TRUE ~ log2(distance)
+        )) 
+    
+    # distance_quant = output %>% 
+    #     group_by(outlier) %>%
+    #     summarise(med_distance = median(distance))
+    # 
+    # print(distance_quant)
+}
+```
+
+```{r}
+exp_with_mpranalyse_outliers_gr = exp_with_mpranalyse_outliers %>% 
+                split(.$iBC) %>% 
+                map(~ makeGRangesFromDataFrame(.x, keep.extra.columns = TRUE))
+```
+
+Distance to closest genes
+
+```{r}
+ensembl = useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl",
+                     mirror = 'uswest')
+```
+
+```{r}
+all_genes = getBM(attributes = 
+                  c('ensembl_gene_id','ensembl_transcript_id','hgnc_symbol', 'strand',
+                    'chromosome_name','start_position','end_position'),
+                  mart = ensembl)
+```
+
+```{r}
+all_genes_filtered = all_genes %>%
+    filter(!grepl('CHR|MT|Y|GL|KI', chromosome_name)) %>%
+    mutate_all(na_if,"") %>%
+    filter(!is.na(hgnc_symbol)) %>%
+    distinct(ensembl_gene_id, hgnc_symbol, chromosome_name, start_position, end_position, strand) %>%
+    mutate(chromosome_name = paste0('chr', chromosome_name),
+           strand = case_when(
+               strand == 1 ~ '+',
+               strand == -1 ~ '-'
+           )) 
+```
+
+```{r message=F}
+all_expressed_genes = read_tsv('../../Core promoters TRIP/Genome annotations/RNA-seq/K562_expressed_genes.txt', 
+                               col_names = c('ensembl_gene_id', 'expression'))
+```
+
+```{r}
+make_gene_grs = function(df){
+    makeGRangesFromDataFrame(df,
+                            start.field = 'start_position',
+                            end.field = 'end_position',
+                            seqnames.field = 'chromosome_name',
+                            keep.extra.columns = T)
+}
+```
+
+```{r}
+all_genes_filtered_by_exp_gr = inner_join(all_genes_filtered, all_expressed_genes) %>% 
+    make_gene_grs() 
+all_unexpressed_genes_gr = anti_join(all_genes_filtered, all_expressed_genes) %>% 
+    make_gene_grs()
+```
+
+```{r}
+write_rds(all_genes_filtered_by_exp_gr, '../Genome annotations/all_expressed_genes_gr.rds')
+write_rds(all_unexpressed_genes_gr, '../Genome annotations/all_unexpressed_genes_gr.rds')
+```
+
+```{r}
+get_distance_to_gene_outliers = function(exp_gr, feature_gr){
+    
+    distances = distanceToNearest(exp_gr, feature_gr, ignore.strand = TRUE)
+    
+    output = as_tibble(exp_gr[queryHits(distances)]) %>%
+        dplyr::select(-end, -width) %>%
+        bind_cols(as_tibble(feature_gr[subjectHits(distances)]) %>% 
+                      dplyr::select(strand) %>% 
+                      rename('gene_strand' = 'strand')) %>% 
+        mutate(distance = mcols(distances)$distance) %>% 
+        mutate(distance = case_when(
+        distance == 0 ~ 0,
+        TRUE ~ log2(distance)
+        )) 
+}
+```
+
+```{r}
+distance_to_genes = exp_with_mpranalyse_outliers_gr %>% 
+    map(~ get_distance_to_gene_outliers(.x, all_genes_filtered_by_exp_gr)) %>% 
+    purrr::reduce(bind_rows)
+
+distance_to_unexpressed_genes = exp_with_mpranalyse_outliers_gr %>% 
+    map(~ get_distance_to_feature_outliers(.x, all_unexpressed_genes_gr)) %>% 
+    purrr::reduce(bind_rows)
+```
+
+```{r}
+# I cannot explain this - either the insulator becomes enhancer in the context of gene or gene silences expression and insulator blocks that
+# Possiblities are all wrong
+distance_to_unexpressed_genes %>%
+    ggplot(aes(direction, distance)) +
+    geom_violin(fill = 'gray') +
+    geom_boxplot(width = 0.1) +
+    pretty_theme_facet() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    xlab('') +
+    ylab('log2(distance)') + 
+    facet_wrap(~ iBC, nrow = 1)
+
+ggsave('mpranalyse_figures/distance_to_unexpressed_genes.png', width = 20, height = 8)
+```
+
+```{r}
+distance_to_genes %>%
+    mutate(lp_gene_strand = case_when(
+        strand == gene_strand ~ 'same',
+        strand != gene_strand ~ 'different'
+    )) %>% 
+    filter(distance == 0 & direction == 'upregulated') %>% 
+    ggbarstats(gene_strand, iBC)
+```
+
+```{r}
+ distance_to_genes %>% 
+    mutate(in_gene = case_when(
+        distance == 0 ~ 'in_gene',
+        TRUE ~ 'intergenic')) %>% 
+    grouped_ggbarstats(direction, in_gene, 
+                       grouping.var = iBC)
+
+ggsave('mpranalyse_figures/in_gene_direction_impact.png', width = 15, height = 15)
+```
+
+```{r}
+distance_to_genes %>% 
+    mutate(in_gene = case_when(
+        distance == 0 ~ 'in_gene',
+        TRUE ~ 'intergenic')) %>% 
+    grouped_ggbarstats(in_gene, direction,
+                       grouping.var = iBC)
+
+ggsave('mpranalyse_figures/number_in_genes.png', width = 10, height = 15)
+```
+
+```{r}
+distance_to_genes %>% 
+    # filter(direction == 'downregulated') %>%
+    mutate(in_gene = case_when(
+        distance == 0 ~ 'in_gene',
+        distance > log2(50000) ~ 'intergenic',
+        TRUE ~ '<50kb'
+    )) %>% 
+    ggplot(aes(in_gene, abs(logFC))) +
+    geom_violin(fill = 'gray') +
+    geom_boxplot(width = 0.1) +
+    pretty_theme_facet() +
+    facet_wrap( ~ iBC, nrow = 1)
+
+# ggsave('mpranalyse_figures/logFC_upregulated_in_gene.png', width = 20, height = 7)
+```
+```{r}
+find_overlap_feature = function(df, feature){
+    
+    overlap = findOverlaps(df, feature)
+    
+    as_tibble(df[queryHits(overlap)]) %>% 
+        select(-width) %>% 
+        bind_cols(as_tibble(feature[subjectHits(overlap)]) %>% 
+                      select(ensembl_gene_id, hgnc_symbol, expression))
+}
+```
+
+```{r}
+outlier_gene_overlap = exp_with_mpranalyse_outliers_gr %>% 
+    map(~ find_overlap_feature(.x, all_genes_filtered_by_exp_gr))
+
+A2_upreg_genes = outlier_gene_overlap$cHS4 %>% 
+    filter(direction == 'upregulated') %>% 
+    select(ensembl_gene_id) %>% 
+    mutate(A2_upreg = TRUE)
+```
+
+```{r}
+find_nearest_gene = function(df, feature){
+    
+    nearest_gene = nearest(df, feature)
+    
+    as_tibble(df) %>%
+        select(-width) %>% 
+        bind_cols(as_tibble(feature[nearest_gene]) %>% 
+                      select(ensembl_gene_id, hgnc_symbol))
+}
+```
+
+```{r}
+all_genes_gr = make_gene_grs(all_genes_filtered)
+```
+
+```{r}
+outliers_nearest_gene_exp = exp_with_mpranalyse_outliers_gr %>% 
+    map(~ find_nearest_gene(.x, all_genes_gr)) %>% 
+    reduce(bind_rows) %>% 
+    left_join(all_expressed_genes) %>% 
+    mutate(expression = replace_na(expression, 0)) 
+```
+
+```{r}
+outliers_nearest_gene_exp %>% 
+    mutate(expression = case_when(
+        expression == 0 ~ 0,
+        TRUE ~ log2(expression)
+    )) %>% 
+    ggplot(aes(direction, expression)) +
+    geom_violin() +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC)
+```
+
+CTCF
+
+```{r message=F}
+CTCF = read_tsv('../../../CAS/Genome annotations/TF ChIP-seq/CTCF_hg38_narrowPeaks.bed.gz', 
+                   col_names = c('chrom', 'start', 'stop', 'crap1', 'crap3', 'crap2', 'score', 'crap4', 'crap5', 'crap6'),
+                show_col_types = FALSE) %>%
+  dplyr::select(-contains('crap')) %>%
+            makeGRangesFromDataFrame(keep.extra.columns = T)
+```
+
+```{r}
+distance_to_CTCF = exp_with_deseq_outliers_gr %>% 
+    map(~ get_distance_to_feature_outliers(.x, CTCF)) %>% 
+    reduce(bind_rows)
+```
+
+```{r}
+distance_to_CTCF %>% 
+    filter(direction != 'upregulated') %>% 
+    arrange_mut() %>% 
+    ggplot(aes(direction, distance)) +
+    geom_violin(fill = 'gray') +
+    geom_boxplot(fill = 'white', width = 0.1) +
+    pretty_theme_facet() + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    xlab('') +
+    ylab('log2(distance)') + 
+    facet_wrap(~ iBC, nrow = 1) +
+    geom_signif(comparisons = list(c('unchanged', 'downregulated')))
+
+# ggsave('mpranalyse_figures/updown regulated distance CTCF.png', width = 20, height = 7)
+```
+```{r}
+select_closest_motif = function(df){
+    df %>% 
+        slice_min(motif_start)
+}
+```
+
+
+```{r}
+read_tsv('../ctcf_motifs_upstream.tsv') %>% 
+    separate(sequence_name, sep = '::', into = c('id', NA)) %>% 
+    mutate(motif_start = start) %>% 
+    select(id, motif_start, strand) %>% 
+    split(.$id) %>% 
+    map(~select_closest_motif(.x)) %>% 
+    reduce(bind_rows)
+```
+
+CTCF orientation
+
+```{r}
+ctcf_motifs_orientation =
+    read_tsv('../ctcf_peak_fimo_processed.tsv',
+             show_col_types = FALSE) %>%
+    dplyr::rename(orientation = strand) %>% 
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+```
+
+```{r}
+find_nearest_motif = function(df, feature){
+    
+    output = nearest(df, feature, 
+                     select = 'all', 
+                     ignore.strand = TRUE)
+    
+    bind_cols(as_tibble(df[queryHits(output)]), 
+          as_tibble(feature[subjectHits(output)]) %>% 
+              dplyr::select(-seqnames, -start, -end, -width, -strand)) %>%
+    dplyr::rename('chr' = 'seqnames', 'stop' = 'end') %>%
+    mutate(ctcf_orientation = case_when(
+        strand == '+' & orientation == '+' ~ 'divergent',
+        strand == '+' & orientation == '-' ~ 'convergent',
+        strand == '-' & orientation == '-' ~ 'divergent',
+        strand == '-' & orientation == '+' ~ 'convergent',
+        orientation == 'both' ~ 'convergent'
+    ))
+}
+```
+
+```{r}
+exp_with_mpranalyse_outliers_gr %>% 
+    map(~ find_nearest_motif(.x, ctcf_motifs_orientation)) %>% 
+    reduce(bind_rows) %>% 
+    grouped_ggbarstats(ctcf_orientation, direction,
+                       grouping.var = iBC)
+
+# ggsave('mpranalyse_figures/ctcf_peak_only.png', width = 10, height = 14)
+```
+
+```{r}
+ctcf_peaks_orientation = read_tsv('../ctcf_peak_motif_orientations.tsv',
+                                  show_col_types = FALSE) %>%
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+```
+
+```{r}
+exp_with_mpranalyse_outliers_gr %>% 
+    map(~ find_nearest_motif(.x, ctcf_peaks_orientation)) %>% 
+    reduce(bind_rows) %>%
+    grouped_ggbarstats(ctcf_orientation, outlier,
+               grouping.var = iBC)
+
+ ggsave('mpranalyse_figures/ctcf_peak_orientation.png', width = 10, height = 14)
+```
+
+Try CTCF precede and follow
+
+```{r}
+find_precede_follow_ctcf = function(gr){
+    
+    preceding_peaks = precede(gr, ctcf_motifs_orientation, select = 'all')
+    following_peaks = follow(gr, ctcf_motifs_orientation, select = 'all')
+    
+    c('precede' = preceding_peaks, 'follow' = following_peaks)
+}
+```
+
+```{r}
+all_precede_follow_peaks = exp_with_mpranalyse_outliers_gr %>% 
+    map(~find_precede_follow_ctcf(.x))
+```
+
+```{r}
+annotate_orientation = function(hits_obj, label){
+    query_gr = exp_with_mpranalyse_outliers_gr[[selected_iBC]][queryHits(hits_obj)]
+    subject_gr = ctcf_motifs_orientation[subjectHits(hits_obj)]
+    
+    distances = distance(query_gr, subject_gr, ignore.strand = TRUE)
+    distance_label = paste('distance', label, sep = '_')
+    
+    bind_cols(as_tibble(query_gr) %>% 
+                  select(-width),
+              as_tibble(subject_gr) %>% 
+                  dplyr::select(orientation)) %>%
+        # right_join(exp_with_deseq_outliers[[selected_iBC]] %>% 
+                       # select(-chr, -stop)) %>%
+        mutate(!!ensym(label) := case_when(
+            strand == '+' & orientation == '+' ~ 'divergent',
+            strand == '-' & orientation == '-' ~ 'divergent',
+            strand == '+' & orientation == '-' ~ 'convergent',
+            strand == '-' & orientation == '+' ~ 'convergent',
+            orientation == 'both' ~ 'convergent'
+        ),
+        !!ensym(distance_label) := distances) #%>% 
+        # select(-orientation) %>%
+        # mutate(!!ensym(distance_label) := case_when(
+        #     !!ensym(distance_label) > 5000 ~ 'far',
+        #     TRUE ~ 'near'
+        # )) %>%
+        # mutate(!!ensym(distance_label) := paste(!!ensym(label), !!ensym(distance_label), sep = '_'))
+}
+```
+
+```{r}
+selected_iBC = 'cHS4'
+annotate_orientation(all_precede_follow_peaks[[selected_iBC]]$precede, 'preceding') %>% 
+    inner_join(annotate_orientation(all_precede_follow_peaks[[selected_iBC]]$follow, 'following')) %>% 
+    mutate(final_orientation = case_when(
+        # preceding == 'divergent' & following == 'divergent' ~ 'divergent',
+        # TRUE ~ 'convergent'
+        distance_preceding == distance_following ~ distance_preceding,
+        distance_preceding == 'divergent_far' & grepl('near', distance_following) ~ distance_following,
+        grepl('near', distance_preceding) & distance_following == 'divergent_far' ~ distance_preceding,
+        grepl('convergent', distance_preceding) ~ distance_preceding,
+        grepl('convergent', distance_following) ~ distance_following
+    )) %>% 
+    mutate(direction = factor(direction, levels = c('unchanged', 'downregulated'))) %>% 
+    filter(preceding == 'convergent' & direction != 'upregulated') %>% 
+    ggplot(aes(direction, log2(distance_preceding), fill = direction)) +
+    geom_violin() +
+    geom_boxplot(width = 0.1, fill = 'white') +
+    pretty_theme() +
+    xlab('') + 
+    scale_fill_manual(values = c('darkgray', '#87562f')) +
+    theme(legend.position = 'none')
+
+ggsave('mpranalyse_figures/distance_to_upstream_convergent_ctcf.pdf', width = 4, height = 5)
+```
+
+```{r}
+selected_iBC = 'A2'
+p = annotate_orientation(all_precede_follow_peaks[[selected_iBC]]$precede, 'preceding') %>% 
+    inner_join(annotate_orientation(all_precede_follow_peaks[[selected_iBC]]$follow, 'following')) %>%
+    mutate(final_orientation = case_when(
+        preceding == 'divergent' & following == 'divergent' ~ 'divergent',
+        TRUE ~ 'convergent')) %>%
+    select_direction('downregulated') %>% 
+    ggbarstats(final_orientation, direction, 
+               results.subtitle = FALSE) +
+    pretty_theme() +
+    theme(text = element_text(size = 18)) +
+    xlab('') +
+    scale_fill_manual(values = c('#3A506B', '#BCE7FD')) 
+
+delete_layers(p, "GeomText")
+
+ggsave('mpranalyse_figures/A2_closest_CTCF_orientation.pdf', width = 5, height = 5)
+```
+
+```{r}
+selected_iBC = 'A2'
+annotate_orientation(all_precede_follow_peaks[[selected_iBC]]$follow, 'following') %>% 
+    arrange_ins() %>% 
+    ggbarstats(following, direction)
+```
+
+BRD4
+
+```{r message=F}
+BRD4 = read_tsv('../../../CAS/Genome annotations/TF ChIP-seq/BRD4_hg38_narrowPeaks.bed.gz', 
+                   col_names = c('chrom', 'start', 'stop', 'crap1', 'crap3', 'crap2', 'score', 'crap4', 'crap5', 'crap6')) %>%
+  dplyr::select(-contains('crap')) %>%
+            makeGRangesFromDataFrame(keep.extra.columns = T)
+```
+
+```{r}
+distance_to_BRD4 = exp_with_mpranalyse_outliers_gr %>% 
+    map(~ get_distance_to_feature_outliers(.x, BRD4)) %>% 
+    reduce(bind_rows)
+```
+
+```{r}
+distance_to_BRD4 %>% 
+    ggplot(aes(outlier, distance)) +
+    geom_violin(fill = 'gray') +
+    geom_boxplot(fill = 'white', width = 0.1) +
+    pretty_theme_facet() + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    xlab('') +
+    ylab('log2(distance)') + 
+    facet_wrap(~ iBC, nrow = 1) +
+    geom_signif(comparisons = list(c('unchanged', 'insulated')))
+```
+
+ATAC
+
+```{r message=F}
+ATAC = read_tsv('../../../CAS/Genome annotations/ATAC/hg38_stablepeaks.bed', 
+                   col_names = c('chrom', 'start', 'stop', 'crap1', 'crap3', 'crap2', 'score', 'crap4', 'crap5', 'crap6')) %>%
+  dplyr::select(-contains('crap')) %>%
+            makeGRangesFromDataFrame(keep.extra.columns = T)
+```
+
+```{r}
+extend_loc_up = function(distance){
+    
+    exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>% 
+    map(~ makeGRangesFromDataFrame(.x %>%
+                                    mutate(start = case_when(
+                                        strand == '+' ~ start - distance,
+                                        strand == '-' ~ start
+                                    ), end = case_when(
+                                        strand == '+' ~ end,
+                                        strand == '-' ~ end + distance
+                                    )), 
+                                   keep.extra.columns = TRUE))
+}
+
+extend_loc_down = function(distance){
+    
+    exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>% 
+    map(~ makeGRangesFromDataFrame(.x %>%
+                                    mutate(start = case_when(
+                                        strand == '+' ~ start,
+                                        strand == '-' ~ start - distance
+                                    ), end = case_when(
+                                        strand == '+' ~ end + distance,
+                                        strand == '-' ~ end 
+                                    )), 
+                                   keep.extra.columns = TRUE))
+}
+```
+
+```{r}
+count_updown_overlaps = function(selected_iBC, distance, dataset){
+    
+    up_gr = extend_loc_up(distance)[[selected_iBC]]
+    down_gr = extend_loc_down(distance)[[selected_iBC]]
+
+    upstream_overlaps = countOverlaps(up_gr, dataset)
+    downstream_overlaps = countOverlaps(down_gr, dataset)
+    
+    up_overlap_counts = bind_cols(as_tibble(up_gr), count = upstream_overlaps) %>%
+                            mutate(updown = 'upstream_peaks')
+    
+    down_overlap_counts = bind_cols(as_tibble(down_gr), count = downstream_overlaps) %>%
+                                        mutate(updown = 'downstream_peaks')
+    
+    bind_rows(up_overlap_counts, down_overlap_counts) %>%
+        mutate(updown = factor(updown, levels = c('upstream_peaks', 'downstream_peaks'))) 
+}
+```
+
+```{r}
+ATAC_updown_overlaps = names(exp_with_mpranalyse_outliers_gr) %>% 
+    map(~ count_updown_overlaps(.x, 20000, ATAC)) %>% 
+    purrr::reduce(bind_rows)
+```
+
+```{r}
+ATAC_updown_overlaps %>% 
+    group_by(iBC, id, direction) %>% 
+    # summarise(total_count = sum(count)) %>% 
+    select_direction('downregulated') %>% 
+    arrange_ins() %>% 
+    # ggplot(aes(iBC, count, group = interaction(iBC, direction))) +
+    ggplot(aes(direction, count)) +
+    geom_violin(aes(fill = direction)) +
+    geom_boxplot(width = 0.1, position = position_dodge(width = 0.9), fill = 'white', outlier.shape = NA) +
+    pretty_theme() +
+    facet_wrap(~ iBC) +
+    geom_signif(comparisons = list(c('downregulated', 'unchanged'))) +
+    xlab('') +
+    ylab('number of ATAC peaks \n within 20kb') +
+    # ylim(0, 17) +
+    scale_fill_manual(values = c('darkgray','#87562f')) #+
+    # theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave('mpranalyse_figures/ins downreg surrounding 20kb ATAC outliers.png', width = 9, height = 6)
+```
+
+```{r}
+ATAC_updown_overlaps %>% 
+    group_by(iBC, id, direction) %>% 
+    summarise(total_count = sum(count)) %>% 
+    filter(direction != 'upregulated') %>% 
+    group_by(iBC, direction) %>% 
+    summarise(med  = median(total_count))
+```
+
+Count STARR-seq overlaps
+
+```{r}
+STARRseq = read_tsv('../Genome annotations/K562_STARR_seq_Genome_Biol/ENCFF045TVA.bed.gz',
+                    col_names = c('chr', 'start', 'end', 'peak_id', 'length',
+                                  paste0('crap', c(1:6))),
+                    show_col_types = FALSE) %>%
+    select(-contains('crap')) %>% 
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+```
+
+```{r}
+STARRseq_updown_overlaps = names(exp_with_mpranalyse_outliers_gr) %>% 
+    map(~ count_updown_overlaps(.x, 10000, STARRseq)) %>% 
+    purrr::reduce(bind_rows)
+```
+
+```{r}
+STARRseq_updown_overlaps %>% 
+    group_by(iBC, id, direction) %>% 
+    # summarise(total_count = sum(count)) %>% 
+    select_direction('downregulated') %>%
+    arrange_ins() %>%
+    # ggplot(aes(iBC, count, group = interaction(iBC, direction))) +
+    ggplot(aes(direction, count)) +
+    geom_violin(aes(fill = direction)) +
+    geom_boxplot(width = 0.1, position = position_dodge(width = 0.9), fill = 'white', outlier.shape = NA) +
+    pretty_theme() +
+    facet_wrap(~ iBC) +
+    geom_signif(comparisons = list(c('downregulated', 'unchanged'))) +
+    xlab('') +
+    # ylab('number of ATAC peaks \n within 20kb') +
+    # ylim(0, 17) +
+    scale_fill_manual(values = c('darkgray','#87562f')) #+
+    # theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Count compiled candidate enhancer overlaps
+
+```{r}
+compiled_enhancers = read_tsv('../Genome annotations/Enhancer_predictions_NBT/Distal_K562_f1df8e8f-c5a5-4731-9135-2359852b41bd.bed',
+         col_names = c('chr', 'start', 'end', 'crap1', 'crap2', 'assay', 'epigenome', 'crap3', 'crap4', 'crap5', 'crap6'), show_col_types = FALSE) %>% 
+    bind_rows(read_tsv('../Genome annotations/Enhancer_predictions_NBT/Proximal_K562_f1df8e8f-c5a5-4731-9135-2359852b41bd.bed', col_names = c('chr', 'start', 'end', 'crap1', 'crap2', 'assay', 'epigenome', 'crap3', 'crap4', 'crap5', 'crap6'), show_col_types = FALSE)) %>% 
+    select(-contains('crap')) %>% 
+    mutate(enhancer_id = paste0('enhancer', seq(1:nrow(.)))) %>% 
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+```
+
+```{r}
+compiled_enhancers_updown_overlaps = names(exp_with_mpranalyse_outliers_gr) %>% 
+    map(~ count_updown_overlaps(.x, 20000, compiled_enhancers)) %>% 
+    purrr::reduce(bind_rows)
+```
+
+```{r}
+compiled_enhancers_updown_overlaps %>% 
+    group_by(iBC, id, direction) %>% 
+    # summarise(total_count = sum(count)) %>% 
+    select_direction('downregulated') %>%
+    arrange_ins() %>%
+    # ggplot(aes(iBC, count, group = interaction(iBC, direction))) +
+    ggplot(aes(direction, count)) +
+    geom_violin(aes(fill = direction)) +
+    geom_boxplot(width = 0.1, position = position_dodge(width = 0.9), fill = 'white', outlier.shape = NA) +
+    pretty_theme() +
+    facet_wrap(~ iBC) +
+    geom_signif(comparisons = list(c('downregulated', 'unchanged'))) +
+    xlab('') +
+    # ylab('number of ATAC peaks \n within 20kb') +
+    # ylim(0, 17) +
+    scale_fill_manual(values = c('darkgray','#87562f')) #+
+    # theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Count predicted silencer overlaps
+
+```{r}
+# read_tsv('../Genome annotations/Silencer_predictions/Candidate_silencers_and_uncharacterized_CREs_human_hg19_roadmap_cell_types.txt', show_col_types = FALSE) %>% 
+#     filter(cell_type == 'E123' & SVM_prediction == 'Candidate_Silencer') %>% 
+#     write_tsv('../Genome annotations/Silencer_predictions/K562_candidate_silencers_hg19.bed', col_names = FALSE)
+
+candidate_silencers =
+read_tsv('../Genome annotations/Silencer_predictions/K562_candidate_silencers_hg38.bed',
+         col_names = c('chr', 'start', 'end', 'peak_id', 'cell_line', 'crap', 'type'),
+         show_col_types = FALSE) %>% 
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+```
+
+```{r}
+silencer_updown_overlaps = names(exp_with_mpranalyse_outliers_gr) %>% 
+    map(~ count_updown_overlaps(.x, 10000, candidate_silencers)) %>% 
+    purrr::reduce(bind_rows)
+```
+
+```{r}
+silencer_updown_overlaps %>% 
+    group_by(iBC, id, direction) %>% 
+    # summarise(total_count = sum(count)) %>% 
+    select_direction('downregulated') %>%
+    arrange_ins() %>%
+    # ggplot(aes(iBC, count, group = interaction(iBC, direction))) +
+    ggplot(aes(direction, count)) +
+    geom_violin(aes(fill = direction)) +
+    geom_boxplot(width = 0.1, position = position_dodge(width = 0.9), fill = 'white', outlier.shape = NA) +
+    pretty_theme() +
+    # facet_wrap(~ iBC) +
+    geom_signif(comparisons = list(c('downregulated', 'unchanged'))) +
+    xlab('') +
+    ylab('number of silencer peaks \n within 20kb') +
+    # ylim(0, 17) +
+    scale_fill_manual(values = c('darkgray','#87562f')) #+
+    # theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+Hi-C 
+
+```{r}
+arrowhead_domains =
+    read_tsv('../../../CAS/Genome annotations/3D_genome/5000_blocks_arrowhead.bedpe', col_types = 'cddcddccccnddddd') %>%
+    filter(!is.na(x1)) %>%
+    dplyr::select('#chr1', x1, x2, score...12) %>%
+    rename(chr = '#chr1', score = score...12) %>%
+    pivot_longer(cols = c('x1', 'x2'), names_to = 'crap', values_to = 'start') %>%
+    mutate(end = start, chr = paste0('chr', chr)) %>%
+    dplyr::select(-crap) %>%
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+```
+
+```{r}
+distance_to_arrowhead = 
+    exp_with_mpranalyse_outliers_gr %>% 
+    map(~ get_distance_to_feature_outliers(.x, arrowhead_domains)) %>% 
+    reduce(bind_rows)
+```
+
+```{r}
+distance_to_arrowhead %>% 
+    # filter(direction != 'upregulated') %>% 
+    arrange_ins() %>% 
+    ggplot(aes(outlier, distance)) +
+    geom_violin(fill = 'gray') +
+    geom_boxplot(fill = 'white', width = 0.1) +
+    pretty_theme_facet() + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    xlab('') +
+    ylab('log2(distance)') + 
+    facet_wrap(~ iBC, nrow = 1) +
+    geom_signif(comparisons = list(c('unchanged', 'insulated')))
+```
+
+```{r}
+distance_to_arrowhead %>% 
+    filter(direction != 'upregulated') %>% 
+    group_by(iBC, direction) %>% 
+    summarise(mean = mean(distance))
+```
+
+```{r}
+find_closest_downstream_arrowhead = function(df){
+    closest_downstream = follow(df, arrowhead_domains)
+    
+    as_tibble(df) %>%
+        dplyr::select(-end, -width) %>%
+        mutate(arrowhead_id = closest_downstream) %>%
+        filter(!is.na(arrowhead_id)) %>% 
+        mutate(closest_start = 
+                   as_tibble(arrowhead_domains[na.omit(closest_downstream)])$start) %>% 
+        mutate(distance_to_downstream_arrowhead = abs(closest_start - start))
+}
+```
+
+```{r}
+exp_with_mpranalyse_outliers_gr %>% 
+    map(~find_closest_downstream_arrowhead(.x)) %>% 
+    reduce(bind_rows) %>% 
+    arrange_ins() %>% 
+    mutate(close = case_when(
+        distance_to_downstream_arrowhead < 50000 ~ 'close',
+        TRUE ~ 'far'
+    )) %>%
+    grouped_ggbarstats(outlier, close,
+                       grouping.var = iBC,
+                       results.subtitle = FALSE,
+                       ggtheme = theme_classic()) +
+    xlab('') 
+    # ggplot(aes(outlier, log2(distance_to_downstream_arrowhead))) +
+    # geom_violin(fill = 'gray') +
+    # geom_boxplot(fill = 'white', width = 0.1) +
+    # pretty_theme_facet() + 
+    # theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    # xlab('') +
+    # ylab('log2(distance)') + 
+    # facet_wrap(~ iBC, nrow = 1) +
+    # geom_signif(comparisons = list(c('unchanged', 'insulated')))
+
+
+ggsave('mpranalyse_figures/50kb_downstream_arrowhead_impact.pdf', width = 10)
+```
+
+```{r}
+exp_with_mpranalyse_outliers_gr %>% 
+    map(~find_closest_downstream_arrowhead(.x)) %>% 
+    reduce(bind_rows) %>% 
+    arrange_ins() %>% 
+    mutate(close = case_when(
+        distance_to_downstream_arrowhead < 50000 ~ 'close',
+        TRUE ~ 'far'
+    )) %>%
+    dplyr::count(iBC, close, outlier) %>%
+    pivot_wider(id_cols = c(iBC, close), names_from = outlier, values_from = n) %>%
+    mutate(unchanged_prop = unchanged/(unchanged+insulated)*100,
+           insulated_prop = insulated/(unchanged+insulated)*100) %>%
+    pivot_longer(cols = c('unchanged_prop', 'insulated_prop'),
+                               names_to = 'outlier', values_to = 'prop') %>%
+    # mutate(direction = factor(direction, 
+    #                           levels = c('upregulated_prop', 'unchanged_prop'))) %>% 
+    ggplot(aes(close, prop, fill = outlier)) +
+    geom_col() +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC) +
+    scale_fill_manual(values = c('burlywood4', 'darkgray')) + 
+    scale_y_continuous(expand = c(0,0), limits = c(0, 105))
+
+ggsave('mpranalyse_figures/50kb_downstream_arrowhead_impact.pdf', width = 9, height = 4.5)
+```
+
+```{r}
+n_loops_per_loc = read_tsv('all_K562_Arima_GW_nReps_3_peakHiC_wSize_80_qWr_1_alphaFDR_0.05_loops.txt',
+         col_types = c('cddddddddddc'),
+         comment = 'chr',
+         col_names = c('chr', 'vp_X1', 'vp_X2', 'anchor_X1', 'anchor_X2', 'anchorSize', 'maxV4Cscore', 'maxV4CscorePos', 'delta',
+                       'ratio', 'minPval', 'id', 'loopID', 'ContactCount', 'covQ', 'dist', 'covQ.norm', 'recip', 'NR.binID')) %>%
+    mutate(chr = paste0('chr', chr)) %>%
+    mutate(chr2 = chr, strand1 = '.', strand2 = '.') %>%
+    dplyr::select(chr, vp_X1, vp_X2, chr2, anchor_X1, anchor_X2, id, maxV4Cscore, strand1, strand2) %>% 
+    count(id) 
+```
+
+```{r}
+inner_join(exp_with_mpranalyse_outliers, n_loops_per_loc) %>%
+    ggplot(aes(direction, n)) +
+    geom_boxplot() +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC)
+```
+
+```{r}
+# read_tsv('all_K562_Arima_GW_nReps_3_peakHiC_wSize_80_qWr_1_alphaFDR_0.05_loops.txt',
+#          col_types = c('cddddddddddc'),
+#          comment = 'chr',
+#          col_names = c('chr', 'vp_X1', 'vp_X2', 'anchor_X1', 'anchor_X2', 'anchorSize', 'maxV4Cscore', 'maxV4CscorePos', 'delta',
+#                        'ratio', 'minPval', 'id', 'loopID', 'ContactCount', 'covQ', 'dist', 'covQ.norm', 'recip', 'NR.binID')) %>%
+#     mutate(chr = paste0('chr', chr)) %>%
+#     mutate(chr2 = chr, strand1 = '.', strand2 = '.') %>%
+#     dplyr::select(chr, vp_X1, vp_X2, chr2, anchor_X1, anchor_X2, id, maxV4Cscore, strand1, strand2) %>%
+#     write_tsv('Arima_mpranalyse_LP_loops.bedpe', col_names = FALSE)
+```
+
+```{r}
+read_tsv('all_K562_Arima_GW_nReps_3_peakHiC_wSize_80_qWr_1_alphaFDR_0.05_loops.txt',
+         col_types = c('cddddddddddc'),
+         comment = 'chr',
+         col_names = c('chr', 'vp_X1', 'vp_X2', 'anchor_X1', 'anchor_X2', 'anchorSize', 'maxV4Cscore', 'maxV4CscorePos', 'delta',
+                       'ratio', 'minPval', 'id', 'loopID', 'ContactCount', 'covQ', 'dist', 'covQ.norm', 'recip', 'NR.binID')) %>%
+    mutate(chr = paste0('chr', chr)) %>% 
+    change_pool_name() %>% 
+    select(gBC, pool, experiment, colnames(.)[1:11]) %>% 
+    mutate_if(is.numeric, round, digits = 4) %>% 
+    write_tsv('supp_table_12-looped_locations_peakHiC.tsv')
+```
+
+```{r}
+# read_tsv('all_K562_Arima_GW_nReps_3_peakHiC_wSize_80_qWr_1_alphaFDR_0.05_loops.txt',
+#          col_types = c('cddddddddddc'),
+#          comment = 'chr',
+#          col_names = c('chr', 'vp_X1', 'vp_X2', 'start', 'end', 'anchorSize', 'maxV4Cscore', 'maxV4CscorePos', 'delta',
+#                        'ratio', 'minPval', 'id')) %>% 
+#     mutate(chr = paste0('chr', chr)) %>%
+#     select(chr, start, end, id) %>% 
+#     write_tsv('all_arima_peakHiC_loops.bed', col_names = FALSE)
+```
+
+```{r message=F}
+chromHMM =
+    read_tsv('../../../CAS/Genome annotations/chromHMM/roadmap_15state_K562_hg38.bed',
+             col_names = c('chr', 'start', 'end', 'annotation', rep(paste0('crap', 1:5))), skip = 1,
+             show_col_types = FALSE) %>% 
+    mutate(collapsed_anno = case_when(
+        grepl('Enh', annotation) ~ 'enhancer',
+        grepl('Tss', annotation) ~ 'promoter',
+        grepl('Het', annotation) ~ 'heterochromatin', 
+        grepl('Quies', annotation) ~ 'quiescent',
+        grepl('Repr', annotation) ~ 'repressed',
+        grepl('Tx', annotation) ~ 'transcribed'
+    )) %>% 
+    dplyr::select(-contains('crap')) %>% 
+    mutate(collapsed_anno = paste(collapsed_anno, c(1:nrow(.)), sep = '_')) %>% 
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+
+# chromHMM = unlist(GenomicRanges::reduce(split(chromHMM, ~collapsed_anno)))
+# chromHMM$collapsed_anno = names(chromHMM)
+```
+
+```{r}
+mcols(arrowhead_domains)$boundary = 'boundary'
+```
+
+```{r}
+all_lp_loops = makeGenomicInteractionsFromFile('Arima_mpranalyse_LP_loops.bedpe', type = 'bedpe')
+annotateInteractions(all_lp_loops, list(chromHMM = chromHMM), id.col = 'collapsed_anno')
+```
+
+```{r}
+# annotateInteractions(all_lp_loops, list(boundary = arrowhead_domains), id.col = 'boundary')
+annotateInteractions(all_lp_loops, list(STARRseq = STARRseq), id.col = 'peak_id')
+# annotateInteractions(all_lp_loops, list(silencer = candidate_silencers), id.col = 'peak_id')
+annotateInteractions(all_lp_loops, list(compiled_enhancers = compiled_enhancers), id.col = 'enhancer_id')
+```
+
+```{r}
+identify_looped_chromHMM = function(anno){
+    
+    anno_name = paste0('n_', anno)
+    
+    counts = as.data.frame(all_lp_loops) %>% 
+        unnest(chromHMM.id2) %>%
+        filter(grepl(anno, chromHMM.id2)) %>%
+        dplyr::count(name) %>%
+        dplyr::rename(id = name)
+
+    exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>%
+    map(~left_join(.x, counts)) %>%
+    purrr::reduce(bind_rows) %>%
+    mutate(!!ensym(anno_name) := replace_na(n, 0)) %>%
+    select(-n)
+}
+```
+
+```{r message=F}
+chromhmm_annos = c('enhancer', 'promoter', 'heterochromatin', 'quiescent', 'repressed', 'transcribed')
+
+exp_deseq_outliers_looped =
+    chromhmm_annos %>% 
+    map(~ identify_looped_chromHMM(.x)) %>% 
+    set_names(chromhmm_annos)
+```
+
+```{r}
+exp_deseq_outliers_looped$enhancer %>% 
+    select_direction('upregulated') %>%  
+    arrange_mut() %>%
+    ggplot(aes(direction, n_enhancer, fill = direction)) +
+    # ggplot(aes(iBC, n_enhancer, group = interaction(iBC, direction))) +
+    geom_violin(aes(fill = direction)) +
+    geom_boxplot(width = 0.1, position = position_dodge(width = 0.9), fill = 'white', outlier.shape = NA) +
+    geom_signif(comparisons = list(c('unchanged', 'upregulated')),textsize = 5) +
+    pretty_theme() +
+    facet_wrap(~iBC, nrow = 1) +
+    # ylim(0, 34) +
+    xlab('') +
+    scale_fill_manual(values = c('darkgray', '#214E34')) +
+    # theme(legend.position = 'none', axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ylab('number of looped \n enhancers')
+
+ggsave('mpranalyse_figures/n_enhancers_mut_upreg_looped.png', width = 8, height = 5)
+```
+
+```{r}
+exp_deseq_outliers_looped$enhancer %>% 
+    filter(direction != 'upregulated') %>% 
+    group_by(iBC, direction) %>% 
+    summarise(med = median(n_enhancer)) 
+```
+
+```{r}
+exp_deseq_outliers_looped$enhancer %>% 
+    distinct(id, n_enhancer) %>% 
+    summarise(median(n_enhancer))
+#     ggplot(aes(n_enhancer)) +
+#     geom_histogram(col = 'black') +
+#     pretty_theme() +
+#     scale_y_continuous(expand = c(0,0), limits = c(-50, 5500))
+# 
+# ggsave('mpranalyse_figures/n_enhancers_per_loc.png')
+```
+
+```{r}
+# downregulated ones tend to have more enhancers for ALOXE3 and cHS4, but not A2
+exp_deseq_outliers_looped$enhancer %>% 
+    filter(outlier == 'insulated') %>% 
+    ggplot(aes(direction, n_enhancer)) +
+    geom_violin(fill = 'gray') +
+    geom_boxplot(width = 0.1) +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC, nrow = 1) +
+    geom_signif(comparisons = list(c('downregulated', 'upregulated'))) 
+```
+
+```{r}
+lp_enhancer_locations =
+    as.data.frame(all_lp_loops) %>% 
+    unnest(chromHMM.id2) %>% 
+    filter(grepl('enhancer', chromHMM.id2)) %>% 
+    select(chromHMM.id2, name) %>% 
+    left_join(as_tibble(chromHMM), by = c('chromHMM.id2' = 'collapsed_anno')) %>% 
+    rename(id = name) %>%
+    distinct()
+
+# revision 1
+lp_compiled_enh_locations =
+    as.data.frame(all_lp_loops) %>% 
+    unnest(compiled_enhancers.id2) %>%
+    select(compiled_enhancers.id2, name) %>%
+    inner_join(compiled_enh_coords) %>%
+    rename(id = name) %>%
+    distinct()
+```
+
+```{r}
+# write_tsv(lp_enhancer_locations, 'enhancers_looped_each_location.tsv')
+write_tsv(lp_compiled_enh_locations, 'compiled_enh_looped_each_location.tsv')
+```
+
+```{r}
+write_enhancers = function(df, file_basename, file_path){
+ 
+    df %>% 
+        filter(direction == 'upregulated') %>% 
+        select(seqnames, start, end, contains('id2')) %>%
+        distinct() %>% 
+        write_tsv(paste0(file_path, file_basename,
+                         '_unshared_upregulated.bed'),
+                  col_names = FALSE)
+    
+    df %>% 
+        filter(direction == 'downregulated') %>% 
+        select(seqnames, start, end, contains('id2')) %>% 
+        distinct() %>% 
+        write_tsv(paste0(file_path, file_basename,
+                         '_unshared_downregulated.bed'),
+                  col_names = FALSE)
+    
+    df %>% 
+        filter(direction == 'unchanged') %>% 
+        select(seqnames, start, end, contains('id2')) %>% 
+        distinct() %>% 
+        write_tsv(paste0(file_path, file_basename, 
+                         '_unshared_unchanged.bed'),
+                  col_names = FALSE)
+}
+```
+
+Different trip locations can be looped with the same enhancer 
+
+```{r}
+exp_deseq_outliers_looped_enhancer_locs =
+    exp_with_mpranalyse_outliers %>%
+    anti_join(locs_ins_all_same_dir) %>%
+    split(.$iBC) %>% 
+    map(~ select(.x, id, iBC, direction)) %>% 
+    map(~ inner_join(.x, lp_enhancer_locations, by = 'id'))
+
+# names(exp_deseq_outliers_looped_enhancer_locs) %>%
+    # map(~ write_enhancers(exp_deseq_outliers_looped_enhancer_locs[[.x]],.x, 'looped_enhancer_bedfiles/'))
+```
+
+```{r}
+exp_deseq_outliers_looped_enhancer_locs_nonunique = 
+exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>% 
+    map(~ select(.x, id, iBC, direction)) %>% 
+    map(~ inner_join(.x, lp_enhancer_locations, by = 'id'))
+
+exp_deseq_outliers_looped_enhancer_locs_nonunique |> 
+  reduce(bind_rows) |> 
+  filter(direction != 'upregulated') |> 
+  select(-width, -strand, -annotation) |> 
+  write_tsv('looped_enhancers_unchanged_downreg_lib_design.tsv')
+```
+
+```{r}
+exp_deseq_outliers_looped_compiled_enhancer_locs_nonunique =
+exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>% 
+    map(~ select(.x, id, iBC, direction)) %>% 
+    map(~ inner_join(.x, lp_compiled_enh_locations, by = 'id'))
+
+exp_deseq_outliers_looped_compiled_enhancer_locs_nonunique |> 
+  reduce(bind_rows) |> 
+  filter(direction != 'upregulated') |> 
+  write_tsv('looped_compiled_enhancers_unchanged_downreg_lib_design.tsv')
+```
+
+Split enhancers by whether they're upstream or downstream
+
+```{r}
+all_lp_locations = 
+    mpranalyse_plus1_alphas %>% 
+    distinct(id, strand, start) %>%
+    rename(lp_start = start) 
+
+lp_updown_enhancer_counts =
+    all_lp_locations %>% 
+    inner_join(lp_enhancer_locations %>% select(-strand), by = 'id') %>% 
+    mutate(up_or_down = case_when(
+        strand == '+' & lp_start > end ~ 'upstream',
+        strand == '+' & lp_start < start ~ 'downstream',
+        strand == '-' & lp_start < start ~ 'upstream',
+        strand == '-' & lp_start > end ~ 'downstream'
+    )) %>% 
+    dplyr::count(id, up_or_down) %>% 
+    pivot_wider(id_cols = id, names_from = up_or_down, values_from = n) %>%
+    right_join(all_lp_locations, by = 'id') %>%
+    mutate(upstream = replace_na(upstream, 0),
+           downstream = replace_na(downstream, 0)) %>%
+    pivot_longer(cols = c('upstream', 'downstream'), names_to = 'up_or_down', values_to = 'n_enhancers')
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>% 
+    map(~left_join(.x, lp_updown_enhancer_counts, by = 'id')) %>% 
+    reduce(bind_rows) %>% 
+    ggplot(aes(direction, n_enhancers)) +
+    geom_violin(fill = 'gray') +
+    geom_boxplot(width = 0.1, position = position_dodge(width = 0.9)) +
+    pretty_theme_facet() +
+    facet_grid(up_or_down ~ iBC) +
+        geom_signif(comparisons = list(c('unchanged', 'upregulated'),
+                                   c('unchanged', 'downregulated'))) +
+    # ylim(0, 30) +
+    theme(text = element_text(size = 18))
+
+# ggsave('mpranalyse_figures/looped_enhancers_updown_per_iBC.pdf', width = 25, height = 12)
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>%
+    distinct(chr, start, strand, id) %>%
+    left_join(lp_updown_enhancer_counts, by = 'id') %>%
+    select(id, n_enhancers, up_or_down) %>% 
+    write_tsv('number_looped_enhancers_per_LP_mpranalyse.tsv')
+```
+
+```{r}
+lp_enhancer_locations
+```
+
+```{r}
+# revision 2
+lp_enhancer_locations_upstream =
+    all_lp_locations %>% 
+    inner_join(lp_enhancer_locations %>% select(-strand), by = 'id') %>% 
+    mutate(up_or_down = case_when(
+        strand == '+' & lp_start > end ~ 'upstream',
+        strand == '+' & lp_start < start ~ 'downstream',
+        strand == '-' & lp_start < start ~ 'upstream',
+        strand == '-' & lp_start > end ~ 'downstream'
+    )) %>% 
+    filter(up_or_down == 'upstream')
+
+exp_deseq_outliers_looped_enhancer_locs_upstream = exp_with_mpranalyse_outliers %>%
+    anti_join(locs_ins_all_same_dir) %>%
+    split(.$iBC) %>% 
+    map(~ select(.x, id, iBC, direction)) %>% upstream_only_looped_downreg_comp_differences
+    map(~ inner_join(.x, lp_enhancer_locations_upstream, by = 'id'))
+
+names(exp_deseq_outliers_looped_enhancer_locs_upstream) %>%
+    map(~ write_enhancers(exp_deseq_outliers_looped_enhancer_locs_upstream[[.x]],.x, 'looped_enhancer_bedfiles/upstream_enhancers_only/'))
+```
+
+
+split by enhancer type
+
+```{r message=F}
+chromHMM_full =
+    read_tsv('../../../CAS/Genome annotations/chromHMM/roadmap_15state_K562_hg38.bed',
+             col_names = c('chr', 'start', 'end', 'annotation', rep(paste0('crap', 1:5))), skip = 1) %>% 
+    mutate(collapsed_anno = case_when(
+        grepl('Enh', annotation) ~ 'enhancer',
+        grepl('Tss', annotation) ~ 'promoter',
+        grepl('Het|ZNF', annotation) ~ 'heterochromatin', 
+        grepl('Quies', annotation) ~ 'quiescent',
+        grepl('Repr', annotation) ~ 'repressed',
+        grepl('Tx', annotation) ~ 'transcribed'
+    )) %>% 
+    select(-contains('crap')) %>% 
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+```
+
+```{r}
+all_lp_loops_full_anno = makeGenomicInteractionsFromFile('Arima_mpranalyse_LP_loops.bedpe', type = 'bedpe')
+
+annotateInteractions(all_lp_loops_full_anno, list(chromHMM = chromHMM_full), id.col = 'annotation')
+```
+
+```{r}
+lp_full_anno_enhancer_counts = 
+    as.data.frame(all_lp_loops_full_anno) %>% 
+    unnest(chromHMM.id2) %>%
+    filter(grepl('Enh', chromHMM.id2)) %>%
+    dplyr::count(name, chromHMM.id2) %>%
+    rename(n_enhancers = n, id = name)
+```
+
+```{r}
+exp_deseq_outliers_looped_full_enhancers = 
+    exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>% 
+    map(~left_join(.x, lp_full_anno_enhancer_counts)) %>% 
+    reduce(bind_rows) %>% 
+    mutate(n_enhancers = replace_na(n_enhancers, 0)) 
+
+exp_deseq_outliers_looped_full_enhancers %>% 
+    grouped_ggbarstats(chromHMM.id2, direction, 
+                       grouping.var = iBC)
+
+ggsave('mpranalyse_figures/looped_enhancer_types.png', width = 10, height = 15)
+```
+
+Looped STARR-seq enhancers
+
+```{r}
+STARRseq_counts_per_loc = as.data.frame(all_lp_loops) %>% 
+    unnest(STARRseq.id2) %>% 
+    dplyr::count(name) %>% 
+    dplyr::rename(id = name)
+
+exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>%
+    map(~left_join(.x, STARRseq_counts_per_loc)) %>%
+    purrr::reduce(bind_rows) %>%
+    mutate(n = replace_na(n, 0)) %>%
+    dplyr::rename(STARRseq_counts = n) %>% 
+    select_direction('downregulated') %>%
+    arrange_mut() %>%
+    ggplot(aes(direction, STARRseq_counts, fill = direction)) +
+    # ggplot(aes(iBC, STARRseq_counts, group = interaction(iBC, direction))) +
+    geom_violin(aes(fill = direction), adjust = 3) +
+    geom_boxplot(width = 0.1, position = position_dodge(width = 0.9), fill = 'white', outlier.shape = NA) +
+    geom_signif(comparisons = list(c('unchanged', 'downregulated')),textsize = 5,
+                map_signif_level = function(p) sprintf("%.3g", p)) +
+    pretty_theme() +
+    facet_wrap(~iBC, nrow = 1) +
+    xlab('') +
+    scale_fill_manual(values = c('darkgray', '#87562f')) +
+    # theme(legend.position = 'none', axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_continuous(name = 'number of looped \n STARR-seq enhancers',
+                     breaks = c(0, 5, 10),
+                     limits = c(0, 14))
+
+# ggsave('mpranalyse_figures/looped_starrseq_downegulated.pdf')
+```
+
+```{r}
+STARR_seq_enhancers_per_loc = as.data.frame(all_lp_loops) %>% 
+    unnest(STARRseq.id2) 
+```
+
+
+```{r}
+compiled_enh_counts_per_loc = as.data.frame(all_lp_loops) %>% 
+    unnest(compiled_enhancers.id2) %>% 
+    dplyr::count(name) %>% 
+    dplyr::rename(id = name)
+
+exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>%
+    map(~left_join(.x, compiled_enh_counts_per_loc)) %>%
+    purrr::reduce(bind_rows) %>%
+    mutate(n = replace_na(n, 0)) %>%
+    dplyr::rename(enhancer_count = n) %>% 
+    select_direction('upregulated') %>%
+    arrange_mut() %>%
+    ggplot(aes(direction, enhancer_count, fill = direction)) +
+    # ggplot(aes(iBC, enhancer_count, group = interaction(iBC, direction))) +
+    geom_violin(aes(fill = direction), adjust = 3) +
+    geom_boxplot(width = 0.1, position = position_dodge(width = 0.9), fill = 'white', outlier.shape = NA) +
+    geom_signif(comparisons = list(c('unchanged', 'upregulated')),textsize = 5,
+                map_signif_level = function(p) sprintf("%.3g", p)) +
+    pretty_theme() +
+    facet_wrap(~iBC, nrow = 1) +
+    xlab('') +
+    scale_fill_manual(values = c('darkgray', '#214E34')) +
+    ylab('number of enhancers (eRNA)') 
+    # theme(legend.position = 'none', axis.text.x = element_text(angle = 45, hjust = 1)) +
+
+# ggsave('mpranalyse_figures/looped_eRNA_enhancers_mut_upregulated.pdf')
+```
+
+```{r}
+compiled_enh_coords =
+    as_tibble(compiled_enhancers) %>% 
+    select(seqnames, start, end, enhancer_id) %>% 
+    dplyr::rename(compiled_enhancers.id2 = enhancer_id)
+```
+
+```{r}
+compiled_enhancer_looped_locations = as.data.frame(all_lp_loops) %>% 
+    unnest(compiled_enhancers.id2) %>% 
+    select(name, compiled_enhancers.id2) %>%
+    dplyr::rename(id = name) %>%
+    inner_join(compiled_enh_coords)
+```
+
+```{r}
+compiled_enhancers_looped_with_outliers =
+    exp_with_mpranalyse_outliers %>% 
+    anti_join(locs_ins_all_same_dir) %>%
+    split(.$iBC) %>%
+    map(~ select(.x, id, iBC, direction)) %>% 
+    map(~ inner_join(.x, compiled_enhancer_looped_locations))
+
+# names(compiled_enhancers_looped_with_outliers) %>%
+    # map(~ write_enhancers(compiled_enhancers_looped_with_outliers[[.x]],.x, 'looped_enhancer_bedfiles/compiled_eRNA_enhancer_bedfiles/'))
+```
+
+```{r}
+# revision 2
+compiled_enhancers_locations_upstream =
+    all_lp_locations %>% 
+    inner_join(compiled_enhancer_looped_locations, by = 'id') %>% 
+    mutate(up_or_down = case_when(
+        strand == '+' & lp_start > end ~ 'upstream',
+        strand == '+' & lp_start < start ~ 'downstream',
+        strand == '-' & lp_start < start ~ 'upstream',
+        strand == '-' & lp_start > end ~ 'downstream'
+    )) %>% 
+    filter(up_or_down == 'upstream')
+
+exp_deseq_outliers_looped_compiled_enhancer_locs_upstream = exp_with_mpranalyse_outliers %>%
+    anti_join(locs_ins_all_same_dir) %>%
+    split(.$iBC) %>% 
+    map(~ select(.x, id, iBC, direction)) %>% 
+    map(~ inner_join(.x, compiled_enhancers_locations_upstream, by = 'id'))
+
+names(exp_deseq_outliers_looped_compiled_enhancer_locs_upstream) %>%
+    map(~ write_enhancers(exp_deseq_outliers_looped_compiled_enhancer_locs_upstream[[.x]],.x, 'looped_enhancer_bedfiles/upstream_compiled_enhancers_only/'))
+```
+
+```{r}
+silencer_counts_per_loc = as.data.frame(all_lp_loops) %>% 
+    unnest(silencer.id2) %>% 
+    dplyr::count(name) %>% 
+    dplyr::rename(id = name)
+
+exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>%
+    map(~left_join(.x, silencer_counts_per_loc)) %>%
+    purrr::reduce(bind_rows) %>%
+    mutate(n = replace_na(n, 0)) %>%
+    dplyr::rename(silencer_counts = n) %>% 
+    select_direction('upregulated') %>%
+    arrange_ins() 
+
+exp_with_mpranalyse_outliers %>%
+    split(.$iBC) %>%
+    map(~left_join(.x, silencer_counts_per_loc)) %>%
+    purrr::reduce(bind_rows) %>%
+    mutate(n = replace_na(n, 0)) %>%
+    dplyr::rename(silencer_counts = n) %>% 
+    select_direction('upregulated') %>%
+    arrange_ins() %>%
+    group_by(iBC, direction) %>% 
+    ggplot(aes(direction, silencer_counts, fill = direction)) +
+    # ggplot(aes(iBC, n_enhancer, group = interaction(iBC, direction))) +
+    geom_violin(aes(fill = direction), adjust = 2) +
+    geom_boxplot(width = 0.1, position = position_dodge(width = 0.9), fill = 'white', outlier.shape = NA) +
+    geom_signif(comparisons = list(c('unchanged', 'upregulated')),textsize = 5) +
+    pretty_theme() +
+    facet_wrap(~iBC, nrow = 1) +
+    # ylim(0, 34) +
+    xlab('') +
+    scale_fill_manual(values = c('darkgray', '#214E34')) +
+    # theme(legend.position = 'none', axis.text.x = element_text(angle = 45, hjust = 1)) +
+    ylab('number of looped \n candidate silencers')
+
+```
+
+Distance to heterochromatin
+
+```{r}
+chromHMM_hetero = filter(chromHMM, grepl('hetero', collapsed_anno)) 
+```
+
+```{r}
+distance_to_hetero = exp_with_mpranalyse_outliers_gr %>% 
+    map(~ get_distance_to_feature_outliers(.x, chromHMM_hetero)) %>%  
+    purrr::reduce(bind_rows)
+```
+
+```{r}
+# hypothesis: upregulated = block silencers = closer to heterochromatin
+# downregulated is closer to heterochromatin, which actually doesn't really make much sense
+distance_to_hetero %>%
+    select_direction('upregulated') %>% 
+    arrange_ins() %>% 
+    ggplot(aes(iBC, distance, group = interaction(iBC, direction))) +
+    # ggplot(aes(direction, distance, fill = direction)) +
+    geom_violin(aes(fill = direction)) + 
+    geom_boxplot(width = 0.1, position = position_dodge(width =0.9), outlier.shape = NA) +
+    pretty_theme() +
+    # facet_wrap(~ iBC) +
+    # geom_signif(comparisons = list(c('unchanged', 'upregulated'))) +
+    # theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_fill_manual(values = c('darkgray', '#214E34')) +
+    xlab('') +
+    ylab('distance to \n heterochromatin') 
+
+ggsave('mpranalyse_figures/ins distance to heterochromatin.pdf', dpi = 600, width = 7, height = 4)
+```
+
+```{r}
+distance_to_hetero %>%
+    select_direction('upregulated') %>% 
+    arrange_ins() %>% 
+    mutate(binned_distance = case_when(
+        distance == 0 ~ '0kb',
+        distance < log2(10000) ~ '10kb',
+        TRUE ~ 'far'
+    )) %>% 
+    grouped_ggbarstats(binned_distance, direction, 
+                       grouping.var = iBC)
+```
+
+```{r}
+distance_to_hetero %>% 
+    filter(iBC == 'ALOXE3') %>%
+    mutate(in_hetero = case_when(
+        distance == 0 ~ 'heterochromatin',
+        TRUE ~ 'outside'
+    )) %>% 
+    ggbarstats(direction, in_hetero)
+```
+Heterochromatin by H3K27me3
+
+```{r}
+distance_to_H3K27me3 = exp_with_mpranalyse_outliers_gr %>% 
+    map(~ get_distance_to_feature_outliers(.x, H3K27me3)) %>%  
+    purrr::reduce(bind_rows)
+```
+
+```{r}
+distance_to_H3K27me3 %>% 
+    filter(grepl('ALOXE3', iBC) & direction != 'downregulated') %>%
+    mutate(in_hetero = case_when(
+        distance == 0 ~ 'heterochromatin',
+        TRUE ~ 'outside'
+    )) %>% 
+    dplyr::count(iBC, in_hetero, direction) %>%
+    pivot_wider(id_cols = c(iBC, in_hetero), names_from = direction, values_from = n) %>%
+    mutate(unchanged_prop = unchanged/(unchanged+upregulated)*100,
+           upregulated_prop = upregulated/(unchanged+upregulated)*100) %>%
+    pivot_longer(cols = c('unchanged_prop', 'upregulated_prop'),
+                               names_to = 'direction', values_to = 'prop') %>%
+    mutate(direction = factor(direction,
+                              levels = c('upregulated_prop', 'unchanged_prop'))) %>%
+    ggplot(aes(in_hetero, prop, fill = direction)) +
+    geom_col() +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC) +
+    scale_fill_manual(values = c('#214E34', 'darkgray'))
+    grouped_ggbarstats(direction, in_hetero,
+                       grouping.var = iBC,
+                       ggtheme = theme_classic())
+
+# ggsave('mpranalyse_figures/ALOXE3_H3K27me3_upreg_proportion.pdf')
+```
+
+```{r}
+read_tsv('Arima_mpranalyse_LP_loops.bedpe', 
+         col_names = c('chr_1', 'start_1', 'end_1', 'chr_2', 'start_2', 'end_2', 
+                      'id', 'score', 'crap1', 'crap2')) %>% 
+    select(-contains('crap')) %>% 
+    mutate(looped_region = end_2 - start_2) %>% 
+    ggplot(aes(log2(looped_region))) +
+    geom_density() +
+    pretty_theme()
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    inner_join(all_fimo_counts_binarised) %>% 
+    group_by(id, iBC, direction) %>% 
+    summarise(total_motifs = sum(peak_count)) %>% 
+    ggplot(aes(iBC, total_motifs, fill = direction)) +
+    geom_boxplot() +
+    pretty_theme() 
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    select_direction('upregulated') %>% 
+    inner_join(all_TF_counts) %>% 
+    group_by(id, iBC, direction) %>% 
+    summarise(total_motifs = sum(peak_count)) %>% 
+    mutate(log_peaks = case_when(
+        total_motifs == 0 ~ 0,
+        TRUE ~ log2(total_motifs)
+    )) %>% 
+    ggplot(aes(iBC, total_motifs, group = interaction(iBC, direction))) +
+    geom_violin(aes(fill = direction)) +
+    geom_boxplot(width = 0.1, position = position_dodge(width =0.9), fill = 'white', outlier.shape = NA) +
+    pretty_theme() +
+    geom_signif(comparisons = list(c('unchanged', 'upregulated'))) +
+    scale_fill_manual(values = c('darkgray', '#214E34'))
+
+ggsave('mpranalyse_figures/outliers_fimo_peaks.png', width = 10, height = 5)
+```
+
+```{r}
+total_looped_peaks = read_parquet('htcf_mapped_files/looped_enhancers_TF_counts.parquet') %>% 
+    rename('id' = '__index_level_0__') %>% 
+    pivot_longer(cols = colnames(select(., -id)), names_to = 'TF', values_to = 'peak_count') %>% 
+    mutate(peak_count = as.numeric(peak_count)) %>% 
+    mutate(peak_overlap = case_when(
+        peak_count == 0 ~ FALSE,
+        TRUE ~ TRUE
+    )) %>% 
+    group_by(id) %>% 
+    summarise(total_looped_peaks = sum(peak_count))
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    select_direction('upregulated') %>% 
+    inner_join(total_looped_peaks) %>% 
+    ggplot(aes(iBC, total_looped_peaks, group = interaction(iBC, direction))) +
+    geom_violin(aes(fill = direction)) +
+    geom_boxplot(width = 0.1, position = position_dodge(width =0.9), fill = 'white', outlier.shape = NA) +
+    pretty_theme() +
+    geom_signif(comparisons = list(c('unchanged', 'upregulated'))) +
+    scale_fill_manual(values = c('darkgray', '#214E34'))
+
+ggsave('mpranalyse_figures/outliers_looped_fimo_peaks.png', width = 10, height = 5)
+```
+
+```{r}
+looped_enhancers_per_loc = exp_with_mpranalyse_outliers %>% 
+    filter(direction == 'upregulated') %>% 
+    inner_join(lp_enhancer_locations, by = 'id') %>% 
+    split(.$iBC)
+```
+
+No they don't really share enhancers 
+
+```{r}
+euler_list = list('A2' = unique(looped_enhancers_per_loc$A2_mut$chromHMM.id2),
+     'ALOXE3' = unique(looped_enhancers_per_loc$ALOXE3_deltaBbox$chromHMM.id2),
+     'cHS4' = unique(looped_enhancers_per_loc$cHS4_x3$chromHMM.id2))
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE, fill =  c("#B7990D", "#8cada7", "#a05c7b"))
+```
+
+Poised chromatin?
+
+```{r}
+poised_chromatin = read_histone_file('H3K4me3_H3K27me3_intersect.bed')
+```
+
+```{r}
+distance_to_poised_chromatin = exp_with_mpranalyse_outliers_gr %>% 
+    map(~ get_distance_to_feature_outliers(.x, poised_chromatin))
+```
+
+```{r}
+reduce(distance_to_poised_chromatin, bind_rows) %>% 
+    arrange_ins() %>% 
+    ggplot(aes(iBC, distance, fill = direction)) +
+    geom_violin() +
+    pretty_theme()
+```
+
+CAGE signal
+
+```{r}
+CAGE = read_tsv('bedtools_mapped_histone_signals/all_expts_10kb_extended_CAGE.bed',
+         col_names = c('chr', 'start', 'end', 'id', 'crap', 'strand', 'cage_score'),
+         show_col_types = FALSE) %>% 
+    select(id, cage_score) %>% 
+    mutate(cage_score = case_when(
+        cage_score == '.' ~ 0,
+        TRUE ~ as.numeric(cage_score)
+    )) 
+```
+
+```{r}
+inner_join(exp_with_mpranalyse_outliers, CAGE) %>% 
+    mutate(cage_score = case_when(
+        cage_score == 0 ~ 0,
+        TRUE ~ log2(cage_score)
+    )) %>% 
+    ggplot(aes(direction, cage_score)) +
+    geom_boxplot() +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC, nrow = 2)
+```
+
+tRNA
+
+```{r}
+tRNAs = read_tsv('../Genome annotations/tRNA/hg38-tRNAs.bed', show_col_types = FALSE,
+         col_names = c('chr', 'start', 'end', 'tRNA', 'crap', 'strand', paste0('crap', seq(1, 6)))) %>% 
+    select(-contains('crap')) %>% 
+    makeGRangesFromDataFrame()
+```
+
+```{r}
+count_tRNA_overlaps = function(selected_iBC, distance){
+    
+    df = exp_with_mpranalyse_outliers %>% filter(iBC == selected_iBC)
+    gr = makeGRangesFromDataFrame(df, keep.extra.columns = TRUE)
+    start(gr) = start(gr) - distance
+    end(gr) = end(gr) + distance
+
+    tRNA_overlap_count = countOverlaps(gr, tRNAs)
+    
+    bind_cols(as_tibble(gr), count = tRNA_overlap_count) 
+}
+```
+
+```{r}
+names(exp_with_mpranalyse_outliers_gr) %>% 
+    map(~ count_tRNA_overlaps(.x, 10000)) %>% 
+    reduce(bind_rows) %>% 
+    arrange_ins() %>% 
+    ggplot(aes(direction, count)) +
+    geom_violin() +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC)
+```
+
+```{r}
+distance_to_tRNAs = exp_with_mpranalyse_outliers_gr %>% 
+    map(~ get_distance_to_feature_outliers(.x, tRNAs)) %>% 
+    reduce(bind_rows)
+```
+
+```{r}
+distance_to_tRNAs %>% 
+    arrange_ins() %>% 
+    ggplot(aes(direction, distance)) +
+    geom_violin() +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC)
+```
+
+Plot AUC
+
+```{r}
+all_AUCs = tribble(~iBC, ~AUC1, ~AUC2, ~AUC3, ~AUC4, ~AUC5, ~AUC6, ~AUC7, ~AUC8, ~AUC9, ~AUC10,  
+        'ALOXE3', 0.59, 0.59, 0.56, 0.65, 0.62, 0.57,0.74,0.64,0.6,0.66,
+        'cHS4_mut', 0.55, 0.56,0.54,0.5,0.55,0.42,0.56,0.58,0.62,0.5,
+        'cHS4', 0.54,0.64,0.57, 0.59,0.6,0.52,0.64,0.57,0.55,0.56,
+        'A2', 0.63,0.54,0.6,0.58,0.61,0.53,0.59,0.5,0.64,0.65,
+        'A2_mut', 0.48,0.4,0.48,0.52,0.45,0.52,0.53,0.46,0.46,0.53,
+        'ALOXE3_mut', 0.53,0.56,0.48,0.52,0.52,0.54,0.62,0.47,0.56,0.45)
+```
+
+```{r}
+error_auc = pivot_longer(all_AUCs, cols = starts_with('AUC'),
+                      names_to = 'rep', values_to = 'AUC') %>% 
+    group_by(iBC) %>% 
+    summarise(error_fc = sd(AUC)/(sqrt(10))) 
+
+
+all_AUCs %>% 
+    mutate(mean_AUC = rowMeans(select(., starts_with("AUC")))) %>% 
+    inner_join(error_auc) %>% 
+    mutate(iBC = factor(iBC, levels = c('A2', 'A2_mut', 'cHS4', 'cHS4_mut', 
+                                        'ALOXE3', 'ALOXE3_mut'))) %>% 
+    ggplot(aes(iBC, mean_AUC, fill = iBC)) +
+    geom_col(col = 'black') +
+    pretty_theme() +
+    geom_errorbar(aes(ymin = mean_AUC, ymax = mean_AUC + error_fc), width = .2) +
+    scale_y_continuous(expand = c(0,0), limits = c(0, 0.7)) +
+    scale_fill_manual(values = c("#b7990d", "#e2d69e", "#a05c7b", "#cfadbd", "#8cada7", "#c5d6d3")) +
+    theme(legend.position = 'none') +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    geom_hline(yintercept = 0.5)
+
+ggsave('mpranalyse_figures/AUC mut.pdf', width = 6, height = 6.5)
+```
+

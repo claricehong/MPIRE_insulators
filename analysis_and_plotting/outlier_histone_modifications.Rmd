@@ -1,0 +1,241 @@
+---
+title: "Untitled"
+output: html_document
+date: "2022-08-12"
+---
+
+```{r message=F}
+library(GenomicRanges)
+library(circlize)
+library(ComplexHeatmap)
+library(tidyverse)
+```
+
+```{r}
+upstream_histone_bedfiles = fs::dir_ls(path = 'bedtools_mapped_histone_signals/', glob = '*upstream*') %>%
+    as.character() %>%
+    purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_10kb_upstream_mean_signal.bed') - 1)
+    })
+
+downstream_histone_bedfiles = fs::dir_ls(path = 'bedtools_mapped_histone_signals/', glob = '*downstream*') %>%
+    as.character() %>%
+    purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_10kb_downstream_mean_signal.bed') - 1)
+    })
+
+both_histone_bedfiles = fs::dir_ls(path = 'bedtools_mapped_histone_signals/', glob = '*extended*') %>%
+    as.character() %>%
+    purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_10kb_extended_mean_signal.bed') - 1)
+    })
+
+```
+
+```{r}
+read_histone_bedfiles = function(file_path, direction){
+    histone_name = paste(direction, 'histone_score', sep = '_')
+    read_tsv(file_path, col_names = c('chr', 'start', 'end', 'id', 'score', 'strand', 'histone_score'),
+             col_types = 'cnncccn') %>% 
+        select(id, histone_score) %>% 
+        mutate(histone_score = replace_na(histone_score, 0)) %>% 
+        rename(!!histone_name := histone_score)
+}
+```
+
+```{r}
+upstream_histone_dfs = upstream_histone_bedfiles %>% 
+    map(~ read_histone_bedfiles(.x, 'up')) 
+
+downstream_histone_dfs = downstream_histone_bedfiles %>% 
+    map(~ read_histone_bedfiles(.x, 'down')) 
+
+both_histone_dfs = both_histone_bedfiles %>% 
+    map(~ read_histone_bedfiles(.x, 'both')) 
+```
+
+```{r}
+all_LP_histone_scores = names(upstream_histone_dfs) %>% 
+    map(~ inner_join(upstream_histone_dfs[[.x]], downstream_histone_dfs[[.x]])) %>% 
+    set_names(names(upstream_histone_dfs)) %>%  
+    map(~ mutate_if(.x, is.numeric, scale))
+```
+
+```{r}
+both_updown_histones =
+    names(both_histone_dfs) %>% 
+    map(~ rename(both_histone_dfs[[.x]], !!ensym(.x) := both_histone_score)) %>% 
+    map(~ mutate_if(.x, is.numeric, scale)) %>% 
+    reduce(inner_join)
+```
+
+```{r}
+names(all_LP_histone_scores) %>% 
+    map(~ mutate(all_LP_histone_scores[[.x]], mod = .x)) %>% 
+    reduce(bind_rows) %>% 
+    ggplot(aes(up_histone_score, down_histone_score)) +
+    geom_point() +
+    pretty_theme_facet() +
+    facet_wrap(~ mod, nrow = 2)
+```
+
+```{r}
+all_LP_histone_mods_reduced = names(all_LP_histone_scores) %>% 
+    map(function(current_mod){
+        new_up = paste0(current_mod, '_up')
+        new_down = paste0(current_mod, '_down')
+        rename(all_LP_histone_scores[[current_mod]], 
+               !!new_up := up_histone_score, 
+               !!new_down := down_histone_score)
+}) %>% 
+    reduce(inner_join)
+```
+
+```{r}
+all_iBC_outliers_histones =
+    exp_with_mpranalyse_outliers %>% 
+    split(.$iBC) %>% 
+    map(function(df){df %>% 
+            select(id, iBC, direction) %>% 
+            inner_join(both_updown_histones) 
+    }) %>% 
+    reduce(bind_rows) %>% 
+    select(-id) %>% 
+    group_by(iBC, direction) %>%
+    summarise_all(mean) %>%
+    ungroup()
+```
+
+```{r}
+get_direction_mat = function(selected_dir){
+    all_iBC_outliers_histones %>% 
+        filter(direction == selected_dir) %>% 
+        column_to_rownames('iBC') %>% 
+        select(-direction) %>% 
+        as.matrix()
+}
+```
+
+```{r}
+directions = c('upregulated', 'downregulated', 'unchanged')
+direction_mats = directions %>% 
+    map(~ get_direction_mat(.x)) %>% 
+    set_names(directions)
+```
+
+```{r}
+col_fun = colorRamp2(c(-0.5, 0.5), c("white", "darkred"))
+
+Heatmap(direction_mats$upregulated,
+        col = col_fun,
+        cluster_columns = FALSE, 
+        name = 'unchanged histones')
+```
+
+```{r}
+all_updownstream_histone_scores_reduced = names(all_LP_histone_scores) %>% 
+    map(function(current_mod){
+        all_LP_histone_scores[[current_mod]] %>% 
+            pivot_longer(cols = colnames(select(., contains('score'))), names_to = 'up_or_downstream', values_to = current_mod)
+}) %>% 
+    reduce(inner_join) %>% 
+    separate(up_or_downstream, into = c('up_or_downstream', NA, NA)) %>% 
+    mutate(up_or_downstream = paste0(up_or_downstream, 'stream'))
+```
+
+```{r}
+all_iBC_outlier_histones_updownstream = exp_with_mpranalyse_outliers %>% 
+    split(.$iBC) %>% 
+    map(function(df){df %>% 
+            select(id, iBC, direction) %>% 
+            inner_join(all_updownstream_histone_scores_reduced) 
+    }) %>% 
+    reduce(bind_rows) %>% 
+    select(-id) %>% 
+    group_by(iBC, direction, up_or_downstream) %>%
+    summarise_all(mean) %>%
+    ungroup()
+```
+
+```{r}
+all_iBC_outliers_histones_for_mat =
+    all_iBC_outliers_histones %>%
+    # all_iBC_outlier_histones_updownstream %>% 
+    # filter(up_or_downstream == 'upstream') %>% 
+    # select(-up_or_downstream) %>% 
+    select(-H4K20me1) %>%
+    mutate(hm_id = paste(iBC, direction, sep = '_')) %>%
+    arrange_mut() %>%
+    filter(direction != 'downregulated') %>%
+    mutate(direction = factor(direction, level = c('unchanged', 'upregulated'))) %>%
+    arrange(direction) %>%
+    column_to_rownames('hm_id')
+```
+
+```{r}
+all_iBC_outlier_histones_updownstream %>% 
+    pivot_longer(cols = colnames(select(., -iBC, -direction, -up_or_downstream)), names_to = 'mod', values_to = 'score') %>% 
+    pivot_wider(id_cols = c(iBC, direction, mod), names_from = up_or_downstream, values_from = score) %>% 
+    ggplot(aes(upstream, downstream)) +
+    geom_point() +
+    pretty_theme()
+```
+ 
+```{r}
+library(colorspace)
+```
+
+```{r}
+col_fun = colorRamp2(c(-0.4, 0, 0.4), diverging_hcl(palette = 'Blue-Yellow', 3))
+left_anno = rowAnnotation(direction = all_iBC_outliers_histones_for_mat$direction,
+                              col = list(direction = outlier_cols))
+
+# png('mpranalyse_figures/mut_upreg_iBC_histones_3_5_end.png', res = 300, width = 6, height = 4, unit = 'in')
+pdf('mpranalyse_figures/mut_upreg_iBC_histones_3_5_end.pdf', width = 6, height = 4)
+ht = Heatmap(all_iBC_outliers_histones_for_mat %>% select(-iBC, -direction),
+        name = 'all_histones', 
+        cluster_rows = FALSE,
+        row_split = all_iBC_outliers_histones_for_mat$iBC,
+        show_row_names = FALSE,
+        column_order = all_clustered_colorder,
+        left_annotation = left_anno,
+        col = col_fun,
+        rect_gp = gpar(col = "white", lwd = 2)
+        ) 
+
+ht = draw(ht)
+# all_clustered_colorder = column_order(ht)
+
+dev.off()
+```
+
+Enhancer histones
+
+```{r}
+enhancer_h3k27ac_files = fs::dir_ls(path = 'looped_enhancer_bedfiles/H3K27ac_signal/', glob = '*H3K27ac*') %>%
+    as.character() %>%
+    purrr::set_names(function(x) {
+    str_sub(fs::path_file(x), end = - str_length('_downregulated_enhancers_mean_H3K27ac.bed') - 1)
+    })
+```
+
+```{r}
+enhancer_h3k27ac = enhancer_h3k27ac_files %>% 
+    map(~ read_tsv(.x, col_names = c('chr', 'start', 'end', 'enhancer_id', 'score'), 
+                   show_col_types = FALSE)) 
+```
+
+```{r}
+names(enhancer_h3k27ac) %>% 
+    map(~ mutate(enhancer_h3k27ac[[.x]], iBC = .x)) %>% 
+    reduce(bind_rows) %>% 
+    mutate(score = case_when(
+        score == '.' ~ 0,
+        TRUE ~ log2(as.double(score))
+    )) %>%
+    ggplot(aes(iBC, score)) +
+    geom_violin(fill = 'gray') +
+    geom_boxplot(width = 0.1) +
+    pretty_theme()
+```
+

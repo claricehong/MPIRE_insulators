@@ -1,0 +1,161 @@
+---
+title: "Untitled"
+output: html_document
+date: "2022-08-16"
+---
+
+```{r message=F}
+library(arrow)
+library(circlize)
+library(ComplexHeatmap)
+library(tidyverse)
+```
+
+```{r}
+mm_norm <- function(x) {
+    return ((x - min(x)) / (max(x) - min(x)))
+}
+```
+
+```{r}
+histone_signals = 
+    read_parquet('htcf_mapped_files/histone_mean_signals_10kb_df.parquet') %>% 
+    dplyr::rename('id' = '__index_level_0__')
+```
+
+```{r}
+distance_to_histones = 
+    read_parquet('htcf_mapped_files/all_distance_to_histones.parquet') %>% 
+    mutate(distance = as.numeric(distance)) %>% 
+    mutate(distance = case_when(
+        distance == 0 ~ 0,
+        TRUE ~ 1/distance
+    )) %>% 
+    pivot_wider(id_cols = 'id', names_from = mod, values_from = distance, 
+                names_prefix = 'distance_')
+```
+
+```{r}
+TF_signals = read_parquet('htcf_mapped_files/selected_TF_10kb_signals.parquet') %>% 
+    dplyr::rename('id' = '__index_level_0__')
+```
+
+```{r}
+distance_to_TF = 
+    read_parquet('htcf_mapped_files/selected_distance_to_tf.parquet') %>% 
+    mutate(distance = as.numeric(distance)) %>% 
+    mutate(distance = case_when(
+        distance == 0 ~ 0,
+        TRUE ~ 1/distance
+    )) %>%
+    pivot_wider(id_cols = 'id', names_from = mod, values_from = distance, 
+                names_prefix = 'distance_')
+```
+
+```{r}
+atac_outlier_df =
+    ATAC_updown_overlaps %>% 
+    distinct(id, updown, count) %>% 
+    group_by(id) %>% 
+    summarise(atac_count = sum(count))
+```
+
+```{r}
+generate_iBC_outlier_hm = function(iBC_df, ins_only){
+    
+    iBC_outliers = iBC_df %>% 
+        dplyr::select(id, direction)
+    
+    output =
+    list(histone_signals, atac_outlier_df, all_TF_counts_per_loc, total_looped_peaks) %>% 
+        purrr::reduce(full_join) %>%
+        left_join(exp_deseq_outliers_looped$enhancer %>% distinct(id, n_enhancer)) %>%
+        left_join(exp_deseq_outliers_looped$repressed %>% distinct(id, n_repressed)) %>% 
+        left_join(CAGE) %>% 
+        mutate(n_enhancer = replace_na(n_enhancer, 0),
+               atac_count = replace_na(atac_count, 0),
+               n_repressed = replace_na(n_repressed, 0)) %>%
+        inner_join(iBC_outliers) %>% 
+        column_to_rownames('id') %>%
+        mutate_if(is.numeric, function(colname){
+            case_when(colname == 0 ~ 0,
+                      TRUE ~ log2(colname))
+        }) %>%
+        mutate_if(is.numeric, scale) 
+    
+    if (ins_only == FALSE){
+        output = output %>% 
+            select(-direction) 
+    } else if (ins_only == TRUE){
+        output = output %>% 
+            filter(direction != 'unchanged') %>%
+            select(-direction)
+    }
+    
+    t(output)
+}
+```
+
+```{r message=F}
+deseq_outlier_feature_hms =
+    exp_with_mpranalyse_outliers %>% 
+    split(.$iBC) %>% 
+    map(~ generate_iBC_outlier_hm(.x, FALSE))
+```
+
+```{r}
+outlier_cols = c('upregulated' = '#214E34', 'unchanged' = 'gray',
+                'downregulated' = '#87562f')
+```
+
+```{r}
+library(viridis)
+```
+
+```{r}
+plot_features_outlier_hm = function(iBC){
+    
+    filename = paste0('mpranalyse_figures/', iBC, ' outlier only features.png')
+    png(filename, res = 300, width = 30, height = 10, unit = 'in')
+    
+    split_df = exp_with_mpranalyse_outliers %>% 
+        split(.$iBC)
+    
+    # iBC_col_order = colnames(deseq_outlier_feature_hms[[iBC]])
+    iBC_direction_ordered = split_df[[iBC]] %>% 
+        dplyr::select(id, direction) %>% 
+        filter(direction != 'unchanged') %>%
+        arrange(direction)
+        # mutate(id = factor(id, levels = iBC_col_order))
+    
+    ordered_hm = deseq_outlier_feature_hms[[iBC]][, iBC_direction_ordered$id]
+    # print(ordered_hm)
+
+    outlier_ha = HeatmapAnnotation(outlier = iBC_direction_ordered$direction,
+                                   col = list(outlier = outlier_cols))
+    
+    col_fun = colorRamp2(seq(-4, 4, length = 15), viridis(15))
+
+    hm = Heatmap(ordered_hm,
+            show_column_names = FALSE,
+            name = 'all_features',
+            top_annotation = outlier_ha,
+            col = col_fun, 
+            # cluster_columns = FALSE
+            column_split = iBC_direction_ordered$direction
+            )
+
+    draw(hm)
+    dev.off()
+}
+```
+
+```{r}
+iBCs = names(exp_with_deseq_outliers)
+```
+
+```{r}
+iBCs  %>% 
+    map(~ plot_features_outlier_hm(.x)) 
+```
+

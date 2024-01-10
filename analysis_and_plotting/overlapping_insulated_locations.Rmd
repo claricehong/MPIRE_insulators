@@ -1,0 +1,422 @@
+---
+title: "Untitled"
+output: html_document
+date: "2022-08-13"
+---
+
+```{r message=F}
+library(circlize)
+library(colorspace)
+library(ComplexHeatmap)
+library(ggstatsplot)
+library(eulerr)
+library(ggsignif)
+library(tidyverse)
+```
+
+```{r}
+get_mpranalyse_iBC = function(selected_iBC, type){
+    
+    if (type == 'both'){
+        exp_with_mpranalyse_outliers %>% 
+        filter(iBC == selected_iBC & outlier == 'insulated')
+    } else {
+        exp_with_mpranalyse_outliers %>% 
+            filter(iBC == selected_iBC & direction == type)
+    }
+}
+```
+
+```{r}
+pdf('mpranalyse_figures/ins_outlier_overlap.pdf', width = 7, height = 7)
+# png('mpranalyse_figures/ins_outlier_overlap.png', res = 300, width = 7, height = 7, units = 'in')
+set.seed(1)
+
+euler_list = list('A2' = get_mpranalyse_iBC('A2', 'both')$id,
+     'ALOXE3' = get_mpranalyse_iBC('ALOXE3', 'both')$id,
+     'cHS4' = get_mpranalyse_iBC('cHS4', 'both')$id) 
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE, fill =  c("#B7990D", "#8cada7", "#a05c7b"))
+# dev.off()
+```
+
+```{r}
+pdf('mpranalyse_figures/ins_upreg_outlier_overlap.pdf', width = 5, height = 5)
+# png('mpranalyse_figures/ins_downregulated_outlier_overlap.png', res = 300, width = 5, height = 5, units = 'in')
+set.seed(1)
+
+euler_list = list('A2' = get_mpranalyse_iBC('A2', 'upregulated')$id,
+     'ALOXE3' = get_mpranalyse_iBC('ALOXE3', 'upregulated')$id,
+     'cHS4' = get_mpranalyse_iBC('cHS4', 'upregulated')$id) 
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE, fill =  c("#B7990D", "#8cada7", "#a05c7b"))
+dev.off()
+```
+
+Simulated overlap
+
+```{r}
+set.seed(4930)
+
+# from https://www.biostars.org/p/458853/
+n_A2_outliers = length(get_mpranalyse_iBC('A2', 'both')$id)
+n_cHS4_outliers = length(get_mpranalyse_iBC('cHS4', 'both')$id)
+n_ALOXE3_outliers = length(get_mpranalyse_iBC('ALOXE3', 'both')$id)
+
+sim_overlaps = map(seq(10000), function(x){
+    sample1 = sample(filter(exp_with_mpranalyse_outliers, iBC == 'A2')$id, 
+                     n_A2_outliers)
+    sample2 = sample(filter(exp_with_mpranalyse_outliers, iBC == 'cHS4')$id,
+                     n_cHS4_outliers)
+    sample3 = sample(filter(exp_with_mpranalyse_outliers, iBC == 'ALOXE3')$id,
+                     n_ALOXE3_outliers)
+    
+    length(reduce(list(sample1, sample2, sample3), intersect))
+})
+```
+
+```{r}
+#187 for both, 86 for upregulated, 50 for downregulated
+(sum(sim_overlaps >= 148) + 1) / (10000 + 1)
+```
+
+```{r}
+as.data.frame(sim_overlaps) %>% 
+    pivot_longer(cols = colnames(.), names_to = 'crap', values_to = 'overlap') %>% 
+    ggplot(aes(overlap)) +
+    geom_histogram(fill = 'darkslategray', col = 'black') +
+    pretty_theme() #+
+    # scale_y_continuous(expand = c(0,0), limits = c(0, 1400)) 
+```
+
+```{r}
+lt = list('A2' = get_mpranalyse_iBC('A2', 'both')$id,
+     'ALOXE3' = get_mpranalyse_iBC('ALOXE3', 'both')$id,
+     'cHS4' = get_mpranalyse_iBC('cHS4', 'both')$id) 
+
+pdf('mpranalyse_figures/pairwise_ins_upset_plot.pdf',width = 6, height = 4.5)
+# png('mpranalyse_figures/pairwise_ins_upset_plot.png', res = 300, width = 6, height = 4.5, unit = 'in')
+m1 = make_comb_mat(lt, mode = 'intersect')
+ss = set_size(m1[comb_degree(m1) >= 2])
+cs = comb_size(m1[comb_degree(m1) >= 2])
+UpSet(m1[comb_degree(m1) >= 2],
+      top_annotation = HeatmapAnnotation(
+        "Insulated LP overlap" = anno_barplot(cs, 
+            ylim = c(0, max(cs)*1.1),
+            border = FALSE, 
+            gp = gpar(fill = "black"), 
+            height = unit(6, "cm")
+        ), 
+        annotation_name_side = "left", 
+        annotation_name_rot = 90),
+      right_annotation = rowAnnotation(
+          "Total LPs" = anno_barplot(ss, 
+            baseline = 0,
+            # axis_param = list(
+            #     at = c(0, -500, -1000, -1500),
+            #     labels = c(0, 500, 1000, 1500),
+            #     labels_rot = 0),
+            border = FALSE, 
+            gp = gpar(fill = "black"), 
+            width = unit(5, "cm")
+        )))
+dev.off()
+```
+
+```{r}
+locs_ins_by_all = exp_with_mpranalyse_outliers %>% 
+    filter(iBC %in% insulators & direction != 'unchanged') %>% 
+    select(id, iBC) %>%
+    split(.$iBC) %>% 
+    reduce(inner_join, by = 'id') %>% 
+    select(id)
+```
+
+```{r}
+locs_ins_all_same_dir = exp_with_mpranalyse_outliers %>% 
+    filter(iBC %in% insulators) %>% 
+    inner_join(locs_ins_by_all) %>% 
+    dplyr::count(id, direction) %>% 
+    filter(n == 3) %>% 
+    select(-n) 
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    filter(iBC %in% insulators) %>% 
+    right_join(locs_ins_by_all) %>% 
+    dplyr::count(id, direction) %>% 
+    filter(n > 1) %>% 
+    mutate(crap = 'crap') %>% 
+    mutate(same_direction = case_when(
+        n == 3 ~ 'Insulated in same direction', 
+        TRUE ~ 'Insulated in different direction'
+    )) %>% 
+    ggpiestats(x = same_direction, y = crap,
+               package = "wesanderson",
+               palette = "Moonrise2",
+               legend.title = 'Overlapping insulated LPs')
+
+ggsave('mpranalyse_figures/ins overlap same direction.pdf')
+```
+
+```{r}
+locs_ins_all_same_dir %>% 
+    dplyr::count(direction)
+```
+
+```{r}
+mpranalyse_plus1_alphas %>% 
+    filter(iBC == 'empty') %>% 
+    left_join(locs_ins_all_same_dir) %>%
+    # bind_rows(mpranalyse_plus1_alphas %>% filter(iBC == 'empty')) %>% 
+    mutate(direction = replace_na(direction, 'unshared')) %>%
+    ggplot(aes(alpha, col = direction)) +
+    geom_density(key_glyph = draw_key_path) +
+    pretty_theme() +
+    scale_color_manual(values = c('#C93312', '#899DA4', '#DC863B')) #+
+    # scale_y_continuous(expand = c(0,0), limits = c(0, 0.34))
+
+# ggsave('mpranalyse_figures/shared_outliers_empty_expression.png')
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    inner_join(locs_ins_all_same_dir, by = 'id') %>% 
+    filter(!iBC %in% insulators) %>%
+    filter(direction.y == 'upregulated') %>% 
+    mutate(direction.x = factor(direction.x, levels = c('unchanged', 'upregulated'))) %>% 
+    ggbarstats(direction.x, iBC,
+               results.subtitle = FALSE) +
+    scale_fill_manual(values = c( '#87562f', 'darkgray')) +
+    pretty_theme() +
+    xlab('')
+
+ggsave('mpranalyse_figures/shared_outliers_downreg_mutants.pdf', width = 7.5, height = 6)
+```
+
+```{r}
+locs_ins_full = exp_with_mpranalyse_outliers %>% 
+    filter(iBC %in% insulators & direction == 'downregulated') %>% 
+    select(id, iBC) %>%
+    split(.$iBC) %>% 
+    reduce(full_join, by = 'id') %>% 
+    select(-contains('iBC')) %>% 
+    anti_join(locs_ins_all_same_dir) %>% 
+    mutate(shared_outliers = 'unshared_downregulated')
+```
+
+```{r}
+shared_outliers_histones = locs_ins_all_same_dir %>% 
+    mutate(shared_outliers = case_when(
+        direction == 'upregulated' ~ 'shared_upregulated',
+        direction == 'downregulated' ~ 'shared_downregulated',
+    )) %>% 
+    bind_rows(locs_ins_full) %>% 
+    right_join(both_updown_histones, by = 'id') %>% 
+    mutate(shared_outliers = replace_na(shared_outliers, 'uninsulated')) %>%
+    group_by(shared_outliers) %>% 
+    summarise_if(is.double, mean) %>% 
+    filter(shared_outliers != 'shared_upregulated') %>%
+    select(-H4K20me1) %>% 
+    column_to_rownames('shared_outliers') 
+    # pivot_longer(cols = colnames(select(., -id, -direction, -shared_outliers)),
+    # names_to = 'mod', values_to = 'signal') %>%
+    # ggplot(aes(signal, mod, fill = shared_outliers)) +
+    # geom_violin() +
+    # pretty_theme()
+```
+
+```{r}
+# updown_split =
+    shared_outliers_histones %>% 
+    pivot_longer(cols = colnames(.), names_to = 'mod', values_to = 'score') %>% 
+    # separate(mod, into = c('mod_only', 'updown'), remove = FALSE) %>% 
+    # select(mod, updown) %>% 
+    # distinct() %>% 
+    # column_to_rownames('mod')
+```
+
+
+```{r}
+col_fun = colorRamp2(c(-0.4, 0, 0.4), diverging_hcl(palette = 'Blue-Yellow', 3))
+# left_anno = rowAnnotation(shared = shared_outliers_histones$shared_outliers)
+
+# png('mpranalyse_figures/shared_outlier_histones_all.png', width = 10, height = 3, unit = 'in',res = 300)
+pdf('mpranalyse_figures/shared_downreg_outlier_histones_all.pdf', width = 6, height = 2)
+Heatmap(shared_outliers_histones,
+        name = 'shared_outliers',
+        col = col_fun,
+        rect_gp = gpar(col = "white", lwd = 2),
+        row_names_side = 'left',
+        show_column_dend = FALSE,
+        show_row_dend = FALSE,
+        column_order = all_clustered_colorder
+        # column_split = updown_split
+        # left_annotation = left_anno,
+        # cluster_rows = FALSE,
+        # show_row_names = FALSE
+        )
+dev.off()
+```
+
+```{r}
+locs_ins_shared_gr = locs_ins_all_same_dir %>% 
+    mutate(shared_outliers = case_when(
+        direction == 'upregulated' ~ 'shared_upregulated',
+        direction == 'downregulated' ~ 'shared_downregulated',
+    )) %>% 
+    bind_rows(locs_ins_full) %>% 
+    right_join(mpranalyse_plus1_alphas) %>% 
+    mutate(shared_outliers = replace_na(shared_outliers, 'not_shared')) %>% 
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+```
+
+```{r}
+locs_ins_shared_chromHMM = findOverlaps(locs_ins_shared_gr, chromHMM_full)
+```
+
+```{r}
+as_tibble(locs_ins_shared_gr[queryHits(locs_ins_shared_chromHMM)]) %>% 
+    select(-width) %>% 
+    bind_cols(as_tibble(chromHMM_full[subjectHits(locs_ins_shared_chromHMM)]) %>% select(collapsed_anno)) %>% 
+    ggbarstats(collapsed_anno, shared_outliers)
+```
+
+```{r}
+overlap_TF_motifs = function(df, motifs, selected_direction){
+    
+    comparison_TF = locs_ins_all_same_dir %>% 
+        mutate(shared = 'shared') %>% 
+        filter(direction == selected_direction)
+    
+    output = left_join(df, locs_ins_all_same_dir %>% mutate(shared = 'shared')) %>% 
+        mutate(shared = case_when(
+            !is.na(shared) ~ shared,
+            is.na(shared) & direction == selected_direction ~ selected_direction,
+            TRUE ~ 'unshared'
+        )) %>% 
+        inner_join(motifs) %>% 
+        # group_by(id, iBC, shared) %>%
+        # summarise(n = sum(peak_overlap))
+        filter(peak_overlap == TRUE) %>%
+        dplyr::count(id, iBC, shared)
+    
+    print(wilcox.test(filter(output, shared == selected_direction)$n,
+            filter(output, shared == 'shared')$n,
+            alternative = 'greater'))
+    
+    output
+}
+```
+
+```{r}
+selected_direction = 'downregulated'
+exp_with_mpranalyse_outliers %>% 
+    split(.$iBC) %>% 
+    keep(names(.) %in% insulators) %>% 
+    map(~ overlap_TF_motifs(.x, 
+            all_TF_counts,
+            selected_direction)) %>% 
+    reduce(bind_rows) %>%
+    # filter(shared != 'unshared') %>%
+    ggplot(aes(shared, n)) +
+    geom_violin(fill = 'gray') +
+    geom_boxplot(width = 0.1) +
+    # geom_density(adjust = 5) +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC) +
+    geom_signif(comparisons = list(c('shared', selected_direction)))
+```
+
+```{r}
+selected_direction = 'downregulated'
+exp_deseq_outliers_looped_enhancer_locs %>% 
+    keep(names(.) %in% insulators) %>% 
+    map(~ overlap_TF_motifs(.x, 
+            inner_join(distinct(looped_downreg_comp_differences, TF), all_TF_counts),
+            selected_direction)) %>% 
+    reduce(bind_rows) %>% 
+    ggplot(aes(shared, n)) +
+    geom_violin(fill = 'gray') +
+    geom_boxplot(width = 0.1) +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC) +
+    geom_signif(comparisons = list(c('shared', selected_direction)))
+```
+
+```{r}
+exp_deseq_outliers_looped_enhancer_locs %>% 
+    keep(names(.) %in% insulators) %>% 
+    map(~ left_join(.x, locs_ins_all_same_dir %>% filter(direction == 'downregulated') %>% mutate(shared = 'shared'))) %>% 
+    map(~ mutate(.x, shared = case_when(
+            !is.na(shared) ~ shared,
+            is.na(shared) & direction == selected_direction ~ 'downregulated',
+            TRUE ~ 'unshared'
+        ))) %>% 
+    reduce(bind_rows) %>% 
+    dplyr::count(iBC, id, shared) %>% 
+    ggplot(aes(shared, n)) +
+    geom_boxplot() +
+    pretty_theme_facet() +
+    facet_wrap(~ iBC)
+```
+
+```{r}
+overlap_fimo_motifs = function(df, selected_direction){
+    df %>% 
+        left_join(locs_ins_all_same_dir %>% mutate(shared = 'shared')) %>% 
+        mutate(shared = case_when(
+            !is.na(shared) ~ shared,
+            is.na(shared) & direction == selected_direction ~ selected_direction,
+            TRUE ~ 'unshared'
+        )) %>% 
+        left_join(all_fimo_counts_binarised) %>% 
+        group_by(iBC, id, shared) %>% 
+        summarise(total_motifs = sum(peak_count))
+}
+```
+
+```{r}
+exp_with_mpranalyse_outliers %>% 
+    filter(iBC %in% insulators) %>% 
+    split(.$iBC) %>% 
+    map(~ overlap_fimo_motifs(.x, 'downregulated')) %>% 
+    reduce(bind_rows) %>% 
+    ggplot(aes(shared, total_motifs)) +
+    geom_boxplot() + 
+    facet_wrap(~ iBC) +
+    pretty_theme_facet()
+```
+
+
+```{r}
+euler_list = list('A2' = get_mpranalyse_iBC('A2_mut', 'downregulated')$id,
+     'ALOXE3' = get_mpranalyse_iBC('ALOXE3_deltaBbox', 'downregulated')$id,
+     'cHS4' = get_mpranalyse_iBC('cHS4_x3', 'downregulated')$id) 
+
+plot(euler(euler_list, shape = 'ellipse'), quantities = TRUE)
+```
+
+```{r}
+all_rep_counts %>% 
+    left_join(locs_ins_all_same_dir %>% mutate(shared = 'shared'), by = c('gBC' = 'id')) %>% 
+    select(-contains('RNA')) %>% 
+    mutate(shared = replace_na(shared, 'unshared'),
+           direction = replace_na(direction, 'unshared')) %>% 
+    filter(condition %in% insulators) %>% 
+    ggplot(aes(shared, log2(DNA_count.R2))) +
+    geom_boxplot() +
+    pretty_theme_facet() +
+    facet_wrap(~ condition, nrow = 1)
+```
+
+```{r}
+all_rep_counts %>% 
+    inner_join(exp_with_mpranalyse_outliers, by = c('gBC' = 'id', 'condition' = 'iBC')) %>% 
+    ggplot(aes(outlier, log2(DNA_count.R1))) +
+    geom_boxplot() +
+    pretty_theme_facet() +
+    facet_wrap(~ condition, nrow = 2)
+```
+

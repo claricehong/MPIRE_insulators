@@ -1,0 +1,132 @@
+---
+title: "Unti    change_iBC_names %>% 
+tled"
+output: html_document
+date: "2022-08-02"
+---
+
+```{r message=F}
+library(circlize)
+library(ComplexHeatmap)
+```
+
+```{r}
+hm_mat =
+    mpranalyse_plus1_alphas %>%
+    # filter(iBC %in% c('A2', 'ALOXE3', 'cHS4', 'empty')) %>%
+    pivot_wider(id_cols = id, names_from = iBC, values_from = alpha) %>%
+    filter(!is.na(`no insulator`)) %>%
+    mutate(sum_na = rowSums(!is.na(.))) %>%
+    filter(sum_na > 1) %>%
+    select(-sum_na) %>%
+    column_to_rownames('id') %>%
+    as.matrix()
+```
+
+```{r}
+nrow(hm_mat)
+```
+
+```{r}
+ix = which(is.na(hm_mat), arr.ind = TRUE)
+hm_mat_imputed = hm_mat
+hm_mat_imputed[ix] = rowMeans(hm_mat_imputed, na.rm = TRUE)[ix[,1]]
+```
+
+```{r}
+imputed_roworder = row_order(Heatmap(hm_mat_imputed, 
+        # cluster_rows = FALSE, 
+        show_row_names = FALSE))
+```
+
+```{r}
+ht = Heatmap(t(hm_mat), show_column_names = FALSE)
+ht = draw(ht)
+col_order = column_order(ht)
+```
+
+```{r}
+library(colorspace)
+```
+
+```{r}
+pdf('mpranalyse_figures/all_insulator_exp_hm.pdf', width = 7, height = 2)
+# png('mpranalyse_figures/all_insulator_exp_hm.png', width = 7, height = 2, units = 'in', res = 600)
+col_fun = colorRamp2(seq(-10, 5, length = 15), sequential_hcl(palette = 'Mako', 15))
+
+Heatmap(t(hm_mat),
+        name = 'log2(expression)',
+        show_column_names = FALSE,
+        col = col_fun, 
+        show_row_dend = FALSE,
+        row_names_side = 'left',
+        column_order = rev(col_order),
+        # na_col = 'white'
+        cluster_rows = FALSE,
+        row_order = iBC_order
+        # row_order = imputed_roworder
+        )
+dev.off()
+```
+
+Plot expression change
+
+```{r}
+insulator_exp = all_expression %>% 
+    filter(iBC != 'empty')
+
+empty_exp = mpranalyse_plus1_alphas %>% 
+    filter(iBC == 'empty') %>% 
+    select(id, alpha)
+```
+
+```{r}
+delta_empty =
+    exp_with_mpranalyse_outliers %>% 
+    change_iBC_names() %>% 
+    # inner_join(insulator_exp, empty_exp, by = 'id') %>%
+    # mutate(delta = exp.x - exp.y) %>%
+    pivot_wider(id_cols = id, names_from = iBC, values_from = logFC) %>%
+    column_to_rownames('id') %>%
+    mutate(row_mean = rowMeans(., na.rm = TRUE)) %>%
+    arrange(row_mean) %>%
+    select(-row_mean) %>%
+    as.matrix()
+```
+
+```{r}
+empty_deltas_hm =
+    as_tibble(delta_empty, rownames = 'id') %>%
+    inner_join(empty_exp) %>%
+    select(id, alpha) %>%
+    column_to_rownames('id') %>%
+    as.matrix()
+```
+
+```{r}
+identical(rownames(empty_deltas_hm),rownames(delta_empty))
+```
+
+```{r}
+pdf('mpranalyse_figures/delta_exp_hm.pdf', width = 3, height = 6)
+# png('mpranalyse_figures/delta_exp_hm.png', width = 3, height = 6, units = 'in', res = 600)
+col_fun = colorRamp2(c(-5, 0, 5), c("darkblue", "white", "darkred"))
+col_fun2 = colorRamp2(seq(-6.5, 3, length = 5), sequential_hcl(palette = 'Light Grays', 5))
+
+ht = Heatmap(delta_empty,
+        name = 'log2(fc)',
+        col = col_fun,
+        show_row_names = FALSE,
+        cluster_rows = FALSE
+        ) + 
+    Heatmap(empty_deltas_hm,
+            name = 'no insulator',
+            col = col_fun2,
+            show_row_names = FALSE,
+            width = unit(0.7, 'cm'))
+
+draw(ht)
+dev.off()
+```
+
+
